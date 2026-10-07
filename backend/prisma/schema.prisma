@@ -1,0 +1,297 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider          = "postgresql"
+  url               = env("DATABASE_URL")
+  // shadowDatabaseUrl = env("SHADOW_DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// ENUMS
+// -----------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  DISTRIBUTOR
+  CLIENT
+}
+
+enum DeviceType {
+  BMS
+  PCS
+  EMU
+  TMS
+  METER
+  IO
+  PV_INVERTER
+}
+
+enum AlarmStatus {
+  ACTIVE
+  ACKNOWLEDGED
+  CLEARED
+}
+
+enum AlarmSeverity {
+  INFO
+  WARNING
+  CRITICAL
+  FATAL
+}
+
+// -----------------------------------------------------------------------------
+// IDENTITY & ACCESS MANAGEMENT (IAM)
+// -----------------------------------------------------------------------------
+
+model User {
+  id           String             @id @default(uuid())
+  name         String
+  email        String             @unique
+  passwordHash String
+  role         Role               @default(CLIENT)
+  forcePasswordChange Boolean     @default(false)
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  // Relationships
+  clientAccess UserClientAccess[]
+  alarmsAcked  Alarm[]            @relation("AlarmAcknowledgedBy")
+}
+
+model Client {
+  id                 String             @id @default(uuid())
+  name               String             @unique
+  businessIdentifier String?            @unique
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  // Relationships
+  users UserClientAccess[]
+  sites Site[]
+}
+
+model UserClientAccess {
+  userId     String
+  clientId   String
+  assignedAt DateTime @default(now())
+  assignedBy String?  // Optional audit field, referencing the Admin who assigned it
+
+  // Relations
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  client Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  @@id([userId, clientId]) // Composite Primary Key
+}
+
+// -----------------------------------------------------------------------------
+// ASSET HIERARCHY
+// -----------------------------------------------------------------------------
+
+model Site {
+  id                 String   @id @default(uuid())
+  name               String
+  businessIdentifier String?  // Unique constraint omitted to allow cross-client reuse of site names if desired, or can be unique per client
+  timezone           String?  // E.g., 'Asia/Kolkata', optional for future reports
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  clientId           String
+
+  // Relations
+  client     Client      @relation(fields: [clientId], references: [id], onDelete: Restrict)
+  bessAssets BESSAsset[]
+
+  @@unique([clientId, businessIdentifier])
+}
+
+model BESSAsset {
+  id              String   @id @default(uuid())
+  name            String
+  assetIdentifier String   @unique // e.g. "Alpha BESS 01"
+  model           String?
+  emuId           String?  @unique
+  mqttTopic       String?  @unique
+  energyCapacity  Float?
+  powerRating     Float?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  siteId          String
+
+  // Relations
+  site    Site     @relation(fields: [siteId], references: [id], onDelete: Restrict)
+  devices Device[]
+  telemetrySnapshots TelemetrySnapshot15m[]
+}
+
+model Device {
+  id          String     @id @default(uuid())
+  type        DeviceType
+  name        String?
+  hardwareId  String?    @unique // e.g., MAC or Serial Number
+  componentId String?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  bessAssetId String
+
+  // Relations
+  bessAsset BESSAsset          @relation(fields: [bessAssetId], references: [id], onDelete: Restrict)
+  telemetry TelemetryHistory[]
+  alarms    Alarm[]
+
+  @@unique([bessAssetId, componentId])
+}
+
+// -----------------------------------------------------------------------------
+// OPERATIONS & LOGGING
+// -----------------------------------------------------------------------------
+
+// Hybrid Telemetry Model
+// Includes required 22 legacy fields for fast querying + JSON payload for extensibility.
+model TelemetryHistory {
+  id        String   @id @default(uuid())
+  timestamp DateTime // Stored in UTC
+  deviceId  String
+  
+  // Legacy Reporting Fields
+  voltageA            Float?
+  voltageB            Float?
+  voltageC            Float?
+  currentA            Float?
+  currentB            Float?
+  currentC            Float?
+  totalPower          Float?
+  pcsActivePower      Float?
+  dcVoltage           Float?
+  ambientTemp         Float?
+  todayChargeEnergy   Float?
+  todayDischargeEnergy Float?
+  accumChargeEnergy   Float?
+  accumDischargeEnergy Float?
+  soc                 Float?
+  soh                 Float?
+  bmsCurrent          Float?
+  cellVMax            Float?
+  cellVMin            Float?
+  cellTempMax         Float?
+  gridSideLoad        Float?
+  solarPower          Float?  // pinv.ai_op_p — PV Inverter Active Power (kW)
+  gridFrequency       Float?  // pcs.ai_freq — Grid Frequency (Hz) (moving to pmg)
+  powerFactor         Float?  // pcs.ai_cos — Power Factor (moving to pmg)
+  bessFrequency       Float?  // rjl.ai_freq
+  bessPowerFactor     Float?  // pcs.ai_cos → BESS/PCS Power Factor
+  solarFrequency      Float?  // pinv.ai_freq
+  solarPowerFactor    Float?  // pinv.ai_cos
+  gridVoltageUab      Float?
+  gridVoltageUbc      Float?
+  gridVoltageUca      Float?
+  gridOnState         Int?
+  gridOffState        Int?
+  bessVoltageUa       Float?
+  bessVoltageUb       Float?
+  bessVoltageUc       Float?
+
+  // Raw/Extensible Payload (for signals not mapped to columns above)
+  rawPayload Json?
+
+  // System ingestion time
+  ingestedAt DateTime @default(now())
+
+  // Relations
+  device Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+
+  // Critical composite index for fast device-specific chronological queries
+  @@index([deviceId, timestamp(sort: Desc)])
+  // Index for efficient rolling data retention cleanup
+  @@index([timestamp])
+}
+
+model Alarm {
+  id                   String        @id @default(uuid())
+  severity             AlarmSeverity
+  message              String
+  status               AlarmStatus   @default(ACTIVE)
+  createdAt            DateTime      @default(now()) // When the fault occurred
+  acknowledgedAt       DateTime?
+  acknowledgedByUserId String?
+  clearedAt            DateTime?
+  deviceId             String
+  faultCode            String?
+
+  // Relations
+  device         Device @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  acknowledgedBy User?  @relation("AlarmAcknowledgedBy", fields: [acknowledgedByUserId], references: [id], onDelete: SetNull)
+  
+  @@index([deviceId, faultCode])
+  // Index for efficient rolling data retention cleanup
+  @@index([createdAt])
+}
+
+// -----------------------------------------------------------------------------
+// SNAPSHOTS & AGGREGATIONS
+// -----------------------------------------------------------------------------
+
+model TelemetrySnapshot15m {
+  id              String   @id @default(uuid())
+  bessAssetId     String
+  bucketTimestamp DateTime // Stored in UTC, represents the start of the 15-minute interval
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  // Meter fields (average)
+  voltageA        Float?
+  voltageB        Float?
+  voltageC        Float?
+  currentA        Float?
+  currentB        Float?
+  currentC        Float?
+  totalPower      Float?
+
+  // PCS fields (average, except energy counters which are latest)
+  pcsActivePower       Float?
+  dcVoltage            Float?
+  ambientTemp          Float?
+  todayChargeEnergy    Float?
+  todayDischargeEnergy Float?
+  accumChargeEnergy    Float?
+  accumDischargeEnergy Float?
+
+  // BMS fields (latest, except current which is average, min/max for cells)
+  soc             Float?
+  soh             Float?
+  bmsCurrent      Float?
+  cellVMax        Float?
+  cellVMin        Float?
+  cellTempMax     Float?
+
+  // Grid (average)
+  gridSideLoad    Float?
+
+  // Solar PV Inverter (average)
+  solarPower      Float?  // pinv.ai_op_p — PV Inverter Active Power (kW)
+
+  // Power Factor (average)
+  powerFactor     Float?  // pcs.ai_cos — Power Factor (moving to pmg)
+
+  // New fields
+  bessFrequency       Float?
+  bessPowerFactor     Float?
+  solarFrequency      Float?
+  solarPowerFactor    Float?
+
+  // Relations
+  bessAsset BESSAsset @relation(fields: [bessAssetId], references: [id], onDelete: Cascade)
+
+  // Critical constraint: One snapshot per BESS per 15-minute bucket
+  @@unique([bessAssetId, bucketTimestamp])
+  
+  // Index for fast chronological queries per BESS.
+  // Note: The unique constraint creates an index automatically in PostgreSQL, 
+  // but we explicitly define one sorted by desc timestamp since Reports usually query newest first.
+  @@index([bessAssetId, bucketTimestamp(sort: Desc)])
+  // Index for efficient rolling data retention cleanup
+  @@index([bucketTimestamp])
+}

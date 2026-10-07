@@ -7,12 +7,24 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
+# Dependencies
+node_modules/
+
+# Build and Output
+dist/
+dist-ssr/
+build/
+
+# Testing
+coverage/
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
 *.local
 
-# Editor directories and files
+# IDE and OS Files
 .vscode/*
 !.vscode/extensions.json
 .idea
@@ -22,3 +34,18 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Temporary backend investigation files
+backend/scripts/scratch/*
+!backend/scripts/scratch/.gitkeep
+
+# Test / E2E output
+test-results/
+playwright-report/
+
+# Local database files
+*.sqlite
+*.db
+
+production_readiness_report.md
+production_readiness_report_final.md
