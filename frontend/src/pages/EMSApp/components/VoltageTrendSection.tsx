@@ -31,12 +31,10 @@ export function VoltageTrendSection({ assetId }: VoltageTrendSectionProps) {
         if (!isPolling) setIsLoading(true);
         setError(null);
         
-        // Parse date for start and end boundaries
-        const start = new Date(selectedDate);
-        start.setHours(0, 0, 0, 0);
-        
-        const end = new Date(start);
-        end.setDate(end.getDate() + 1);
+        // Parse date for start and end boundaries in local time
+        const [year, month, day] = selectedDate.split('-').map(Number);
+        const start = new Date(year, month - 1, day, 0, 0, 0, 0);
+        const end = new Date(year, month - 1, day + 1, 0, 0, 0, 0);
 
         const result = await dashboardService.getBessVoltageTrend(assetId, start, end);
         setData(result);
@@ -90,11 +88,9 @@ export function VoltageTrendSection({ assetId }: VoltageTrendSectionProps) {
   }, [telemetry, showGraph, selectedDate, isConnected]);
 
   const handleExport = () => {
-    const start = new Date(selectedDate);
-    start.setHours(0, 0, 0, 0);
-    
-    const end = new Date(start);
-    end.setDate(end.getDate() + 1);
+    const [year, month, day] = selectedDate.split('-').map(Number);
+    const start = new Date(year, month - 1, day, 0, 0, 0, 0);
+    const end = new Date(year, month - 1, day + 1, 0, 0, 0, 0);
 
     const url = new URL(`${API_BASE}/api/bess/${assetId}/voltage-trend/export`);
     url.searchParams.set('from', start.toISOString());
