@@ -1,7 +1,8 @@
 import { mqttService } from './src/services/mqtt.service';
 import mqtt from 'mqtt';
 
-import { describe, test } from 'vitest';
+import { describe, test, vi } from 'vitest';
+import { prisma } from '../../src/db/prisma';
 
 describe('MQTT Ingestion', () => {
   test('Runs all checks', async () => {
@@ -25,6 +26,7 @@ describe('MQTT Ingestion', () => {
   const clearOutputs = () => { warnings = []; logs = []; };
 
   // Helper to test payloads
+  const findUniqueSpy = vi.spyOn(prisma.bESSAsset, 'findUnique').mockResolvedValue(null);
   const testPayload = async (payload: any) => {
     clearOutputs();
     await mqttService.handleMessage('test/topic', Buffer.from(typeof payload === 'string' ? payload : JSON.stringify(payload)));
@@ -88,15 +90,12 @@ describe('MQTT Ingestion', () => {
   await testPayload(validPayload);
   assert(warnings.some(w => w.includes('Warning: Unknown EMU 2412131092. Persistence skipped.')), 'Unresolved Device association safely skips persistence');
 
-  // Restore console
+  // Restore spy and console
+  findUniqueSpy.mockRestore();
   console.warn = origWarn;
-  console.log = origLog;
-
   console.log = origLog;
   });
 });
-
-import { prisma } from '../../src/db/prisma';
 
 describe('MQTT Topic + BESS Identity Validation', () => {
   const assert = (condition: boolean, testName: string) => {

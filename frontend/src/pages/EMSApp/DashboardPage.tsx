@@ -224,7 +224,7 @@ function mergeWsPayload(
 // ---------------------------------------------------------------------------
 // Site-Level Aggregation
 // ---------------------------------------------------------------------------
-function useAggregatedSiteTelemetry(
+function aggregateSiteTelemetry(
   state: Record<string, DashboardTelemetryState>
 ): DashboardTelemetryState {
   const bessStates = Object.values(state);
@@ -526,7 +526,7 @@ export default function DashboardPage() {
     const hasTimestamp = Object.values(telemetryState).some(s => s.timestamp);
     if (!hasTimestamp) return;
 
-    const aggregated = useAggregatedSiteTelemetry(telemetryState);
+    const aggregated = aggregateSiteTelemetry(telemetryState);
     const nowTs = Date.now();
     
     setHistoricalData(prev => {
@@ -559,7 +559,7 @@ export default function DashboardPage() {
   // Freshness
   // ---------------------------------------------------------------------------
   
-  const aggregatedTelemetry = useAggregatedSiteTelemetry(telemetryState);
+  const aggregatedTelemetry = aggregateSiteTelemetry(telemetryState);
 
   const freshnessLabel = (() => {
     if (!aggregatedTelemetry.timestamp) return 'NO DATA';
