@@ -62,7 +62,13 @@ async function main() {
     console.log('\nPostgreSQL container (ems-postgres) is already running.');
   } else if (checkDocker()) {
     console.log('\nStarting PostgreSQL container via Docker Compose...');
-    run('docker compose up -d');
+    // Clean up any stale EMS containers that may conflict
+    try {
+      execSync('docker rm -f ems-postgres ems-backend ems-frontend', { stdio: 'ignore' });
+    } catch (e) {
+      // ignore if containers do not exist
+    }
+    run('docker compose up -d --force-recreate');
   } else {
     console.warn('\nWarning: Docker does not appear to be running.');
     console.warn('Make sure PostgreSQL is running manually at localhost:5432.\n');
