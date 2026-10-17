@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:17-alpine
-    container_name: ems-postgres
+    # container_name: ems-postgres  # removed to avoid name conflict
     restart: unless-stopped
     ports:
       - "5432:5432"
@@ -21,7 +21,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    container_name: ems-backend
+    # container_name: ems-backend  # removed to avoid name conflict
     restart: unless-stopped
     ports:
       - "5000:5000"
@@ -47,7 +47,7 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_API_URL: http://localhost:5000
-    container_name: ems-frontend
+    # container_name: ems-frontend  # removed to avoid name conflict
     restart: unless-stopped
     ports:
       - "5173:80"
