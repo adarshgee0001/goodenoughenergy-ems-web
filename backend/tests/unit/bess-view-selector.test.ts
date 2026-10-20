@@ -969,76 +969,79 @@ describe('Step 3 — Multi-BESS: SOC, SOH, Today Charge/Discharge, Energy Flow &
     expect(content).toContain('<table className="w-full text-left border-collapse">');
     expect(content).toContain('tableSnapshots');
     expect(content).toContain('handlePageChange');
+    expect(content).toContain('authoritativeHeaders.map');
 
-    // 2. Original required headers and pagination controls are present
-    expect(content).toContain('Time');
-    expect(content).toContain('BESS Asset');
+    // 2. Authoritative required headers and pagination controls are present
+    expect(content).toContain('Timestamp');
+    expect(content).toContain('BESS Name');
     expect(content).toContain('EMU Serial No.');
-    expect(content).toContain('Grid Side Load (kW)');
+    expect(content).toContain('Grid Side Load');
     expect(content).toContain('Grid Frequency (Hz)');
     expect(content).toContain('Grid Power Factor');
-    expect(content).toContain('Cabinet Meter Power (kW)');
-    expect(content).toContain('Cabinet Voltage A (V)');
-    expect(content).toContain('Cabinet Voltage B (V)');
-    expect(content).toContain('Cabinet Voltage C (V)');
-    expect(content).toContain('Cabinet Current A (A)');
-    expect(content).toContain('Cabinet Current B (A)');
-    expect(content).toContain('Cabinet Current C (A)');
     expect(content).toContain('BESS Frequency (Hz)');
     expect(content).toContain('BESS Power Factor');
-    expect(content).toContain('PCS Active Power (kW)');
+    expect(content).toContain('PCS Active Power');
     expect(content).toContain('PCS Temperature (°C)');
+    expect(content).toContain('Line Voltage (V)');
+    expect(content).toContain('AC Current (A)');
+    expect(content).toContain('Operating Mode');
     expect(content).toContain('SOC (%)');
     expect(content).toContain('SOH (%)');
     expect(content).toContain('BMS Current (A)');
+    expect(content).toContain('BMS DC Voltage (V)');
+    expect(content).toContain('Cabinet State');
     expect(content).toContain('Cell V Max (V)');
     expect(content).toContain('Cell V Min (V)');
     expect(content).toContain('Cell Temp Max (°C)');
-    expect(content).toContain('Today Charge Energy (kWh)');
-    expect(content).toContain('Today Discharge Energy (kWh)');
-    expect(content).toContain('Accum Charge Energy (kWh)');
-    expect(content).toContain('Accum Discharge Energy (kWh)');
-    expect(content).toContain('Solar Power (kW)');
+    expect(content).toContain('Today Charge Energy');
+    expect(content).toContain('Today Discharge Energy');
+    expect(content).toContain('Accum Charge Energy');
+    expect(content).toContain('Accum Discharge Energy');
+    expect(content).toContain('Solar Power');
 
     // Pagination controls
     expect(content).toContain('Previous');
     expect(content).toContain('Next');
     expect(content).toContain('Math.ceil(tableTotal / pageSize)');
 
-    // 3. DC Voltage header is absent from table
+    // 3. DC Voltage header and obsolete cabinet meter columns are absent from table
     expect(content).not.toContain('>DC Voltage (V)<');
     expect(content).not.toContain('DC Voltage (V)</th>');
+    expect(content).not.toContain('Cabinet Voltage A (V)');
+    expect(content).not.toContain('Cabinet Meter Power');
 
-    // 4. DC Voltage data cell is absent from each row
+    // 4. DC Voltage and legacy data cells are absent from each row
     expect(content).not.toContain('pt.dcVoltage');
+    expect(content).not.toContain('pt.voltageA');
 
-    // 5. All remaining row cells remain aligned with headers
-    expect(content).toContain('formatTimestamp(pt.bucketTimestamp)');
-    expect(content).toContain('formatValue(pt.gridSideLoad)');
+    // 5. Authoritative row cells remain aligned with headers and user preferences
+    expect(content).toContain('formatTimestamp(pt.bucketTimestamp');
+    expect(content).toContain('pt.bessAssetId');
+    expect(content).toContain('pt.emuId');
+    expect(content).toContain('formatPowerValue(pt.gridSideLoad');
     expect(content).toContain('formatValue(pt.gridFrequency, 2)');
     expect(content).toContain('formatValue(pt.powerFactor, 2)');
-    expect(content).toContain('formatValue(pt.totalPower)');
-    expect(content).toContain('formatValue(pt.voltageA)');
-    expect(content).toContain('formatValue(pt.voltageB)');
-    expect(content).toContain('formatValue(pt.voltageC)');
-    expect(content).toContain('formatValue(pt.currentA)');
-    expect(content).toContain('formatValue(pt.currentB)');
-    expect(content).toContain('formatValue(pt.currentC)');
     expect(content).toContain('formatValue(pt.bessFrequency, 2)');
     expect(content).toContain('formatValue(pt.bessPowerFactor, 2)');
-    expect(content).toContain('formatValue(pt.pcsActivePower)');
-    expect(content).toContain('formatValue(pt.ambientTemp)');
-    expect(content).toContain('formatValue(pt.soc)');
-    expect(content).toContain('formatValue(pt.soh)');
-    expect(content).toContain('formatValue(pt.bmsCurrent)');
-    expect(content).toContain('formatValue(pt.cellVMax)');
-    expect(content).toContain('formatValue(pt.cellVMin)');
-    expect(content).toContain('formatValue(pt.cellTempMax)');
-    expect(content).toContain('formatValue(pt.todayChargeEnergy)');
-    expect(content).toContain('formatValue(pt.todayDischargeEnergy)');
-    expect(content).toContain('formatValue(pt.accumChargeEnergy)');
-    expect(content).toContain('formatValue(pt.accumDischargeEnergy)');
-    expect(content).toContain('formatValue(pt.solarPower)');
+    expect(content).toContain('formatPowerValue(pt.pcsActivePower');
+    expect(content).toContain('formatValue(pt.pcsTemperature, 1)');
+    expect(content).toContain('formatValue(pt.pcsLineVoltage, 1)');
+    expect(content).toContain('formatValue(pt.pcsAcCurrent, 1)');
+    expect(content).toContain('formatTmsMode(pt.tmsOperatingMode)');
+    expect(content).toContain('formatValue(pt.tmsAmbientTemp, 1)');
+    expect(content).toContain('formatValue(pt.soc, 1)');
+    expect(content).toContain('formatValue(pt.soh, 1)');
+    expect(content).toContain('formatValue(pt.bmsCurrent, 1)');
+    expect(content).toContain('formatValue(pt.bmsDcVoltage, 1)');
+    expect(content).toContain('formatCabinetState(pt.bmsCabinetState)');
+    expect(content).toContain('formatValue(pt.cellVMax, 3)');
+    expect(content).toContain('formatValue(pt.cellVMin, 3)');
+    expect(content).toContain('formatValue(pt.cellTempMax, 1)');
+    expect(content).toContain('formatEnergyValue(pt.todayChargeEnergy');
+    expect(content).toContain('formatEnergyValue(pt.todayDischargeEnergy');
+    expect(content).toContain('formatEnergyValue(pt.accumChargeEnergy');
+    expect(content).toContain('formatEnergyValue(pt.accumDischargeEnergy');
+    expect(content).toContain('formatPowerValue(pt.solarPower');
 
     // Required controls and charts are preserved
     expect(content).toContain('Historical Reports');
