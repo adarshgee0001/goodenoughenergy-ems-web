@@ -38,13 +38,15 @@ import DistributorDashboardPlaceholder from '../pages/Placeholders/DistributorDa
 
 // Admin Preview
 import { PreviewProvider } from '../context/PreviewContext';
+import { UserSettingsProvider } from '../features/settings/context/UserSettingsContext';
 
 function App() {
   return (
     <AuthProvider>
       <PreviewProvider>
-        <WebSocketProvider>
-          <ScrollToTop />
+        <UserSettingsProvider>
+          <WebSocketProvider>
+            <ScrollToTop />
           <Routes>
         {/* Root redirects based on role */}
         <Route path="/" element={<RoleBasedRedirect />} />
@@ -101,7 +103,8 @@ function App() {
         {/* Catch-all route to handle old marketing routes */}
         <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
-        </WebSocketProvider>
+          </WebSocketProvider>
+        </UserSettingsProvider>
       </PreviewProvider>
     </AuthProvider>
   );

@@ -18,6 +18,7 @@ export function CreateBessModal({ isOpen, onClose, onSuccess, siteId }: CreateBe
   const [model, setModel] = useState('');
   const [energyCapacity, setEnergyCapacity] = useState('');
   const [powerRating, setPowerRating] = useState('');
+  const [reportIntervalMinutes, setReportIntervalMinutes] = useState(15);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -47,7 +48,8 @@ export function CreateBessModal({ isOpen, onClose, onSuccess, siteId }: CreateBe
         model.trim() || undefined, 
         energyCapacity, 
         powerRating,
-        mqttTopic.trim() || null
+        mqttTopic.trim() || null,
+        reportIntervalMinutes
       );
       onSuccess(newAsset);
       
@@ -58,6 +60,7 @@ export function CreateBessModal({ isOpen, onClose, onSuccess, siteId }: CreateBe
       setModel('');
       setEnergyCapacity('');
       setPowerRating('');
+      setReportIntervalMinutes(15);
     } catch (err) {
       if (err instanceof Error) {
         setError(err.message);
@@ -208,6 +211,28 @@ export function CreateBessModal({ isOpen, onClose, onSuccess, siteId }: CreateBe
                 className="w-full px-4 py-2 border border-slate-300 rounded-lg shadow-sm focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
               />
             </div>
+          </div>
+
+          <div>
+            <label htmlFor="bess-interval" className="block text-sm font-medium text-slate-700 mb-1">
+              Reporting Interval (Minutes)
+            </label>
+            <select
+              id="bess-interval"
+              disabled={isSubmitting}
+              value={reportIntervalMinutes}
+              onChange={(e) => setReportIntervalMinutes(parseInt(e.target.value, 10))}
+              className="w-full px-4 py-2 border border-slate-300 rounded-lg shadow-sm focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-slate-900 disabled:bg-slate-50 disabled:text-slate-500"
+            >
+              {[...Array(20)].map((_, i) => (
+                <option key={i + 1} value={i + 1}>
+                  {i + 1} minute{i > 0 ? 's' : ''}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-slate-500">
+              Applies to all BESS assets in this site for synchronized reporting.
+            </p>
           </div>
 
           <div className="pt-4 flex items-center justify-end gap-3">

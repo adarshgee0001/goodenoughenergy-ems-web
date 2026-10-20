@@ -3,16 +3,25 @@ import { useParams, Link } from 'react-router-dom';
 import { dashboardService } from '../../features/dashboard/dashboard.service';
 import type { DashboardSite, DashboardBessAsset, DashboardDevice, DashboardTelemetryState } from '../../features/dashboard/dashboard.types';
 import { BatteryMedium, Activity, Zap, ChevronRight, ChevronLeft, Cpu, Loader2, AlertCircle } from 'lucide-react';
+import { useUserSettings } from '../../features/settings/hooks/useUserSettings';
 import { KPICard } from './components/EMSKPICard';
 
 export default function BESSAssetDetailsPage() {
   const { assetId } = useParams<{ assetId: string }>();
+  const { formatPower, formatEnergy, setActiveSiteTimezone } = useUserSettings();
   const [asset, setAsset] = useState<DashboardBessAsset | null>(null);
   const [site, setSite] = useState<DashboardSite | null>(null);
   const [devices, setDevices] = useState<DashboardDevice[]>([]);
   const [telemetry, setTelemetry] = useState<DashboardTelemetryState | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Synchronize active site timezone with UserSettingsContext
+  useEffect(() => {
+    if (site?.timezone) {
+      setActiveSiteTimezone(site.timezone);
+    }
+  }, [site?.timezone, setActiveSiteTimezone]);
 
   useEffect(() => {
     async function loadData() {
@@ -90,12 +99,37 @@ export default function BESSAssetDetailsPage() {
         </div>
         <h1 className="text-2xl font-bold text-slate-900 mb-2">Error Loading Asset</h1>
         <p className="text-slate-500 mb-6 max-w-md">{error || 'The asset could not be found.'}</p>
-        <Link to="/app/bess" className="inline-flex items-center text-primary-600 hover:text-primary-800 font-medium">
+        <Link to="/app/bess" className="inline-flex items-center text-primary-600 hover:text-primary-800 transition-colors duration-150 ease-out focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary-500 rounded font-medium">
           <ChevronLeft className="w-4 h-4 mr-1" /> Back to Assets
         </Link>
       </div>
     );
   }
+
+  const energyCapacityFmt = formatEnergy((asset as any)?.energyCapacity);
+  const energyCapacityDisplay = energyCapacityFmt.displayValue !== '--'
+    ? `${Number(energyCapacityFmt.displayValue).toLocaleString()} ${energyCapacityFmt.unit}`
+    : '--';
+
+  const powerRatingFmt = formatPower((asset as any)?.powerRating);
+  const powerRatingDisplay = powerRatingFmt.displayValue !== '--'
+    ? `${Number(powerRatingFmt.displayValue).toLocaleString()} ${powerRatingFmt.unit}`
+    : '--';
+
+  const activePowerFmt = formatPower(
+    telemetry?.bessPower !== undefined && telemetry.bessPower !== null
+      ? Math.abs(telemetry.bessPower)
+      : undefined,
+    4
+  );
+  const activePowerDisplay = activePowerFmt.displayValue !== '--'
+    ? `${activePowerFmt.displayValue} ${activePowerFmt.unit}`
+    : '--';
+
+  const todayChargeFmt = formatEnergy(telemetry?.todayChargeEnergy);
+  const todayDischargeFmt = formatEnergy(telemetry?.todayDischargeEnergy);
+  const accChargeFmt = formatEnergy(telemetry?.accChargeEnergy);
+  const accDischargeFmt = formatEnergy(telemetry?.accDischargeEnergy);
 
   return (
     <div className="space-y-6">
@@ -124,31 +158,36 @@ export default function BESSAssetDetailsPage() {
       </div>
 
       {/* KPI Summary */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-4">
-        <KPICard 
-          title="Identifier" 
-          value={asset.assetIdentifier} 
-          icon={<BatteryMedium className="w-5 h-5" />} 
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
+        <KPICard
+          title="Identifier"
+          value={asset.assetIdentifier}
+          icon={<BatteryMedium className="w-5 h-5" />}
         />
-        <KPICard 
-          title="Model" 
-          value={(asset as any).model || '--'} 
-          icon={<Cpu className="w-5 h-5" />} 
+        <KPICard
+          title="EMU Serial No."
+          value={asset.emuId || '--'}
+          icon={<Cpu className="w-5 h-5" />}
         />
-        <KPICard 
-          title="Energy Capacity" 
-          value={((asset as any).energyCapacity !== null && (asset as any).energyCapacity !== undefined) ? `${((asset as any).energyCapacity).toLocaleString()} kWh` : '--'} 
-          icon={<Zap className="w-5 h-5" />} 
+        <KPICard
+          title="Model"
+          value={asset.model || '--'}
+          icon={<Cpu className="w-5 h-5" />}
         />
-        <KPICard 
-          title="Power Rating" 
-          value={((asset as any).powerRating !== null && (asset as any).powerRating !== undefined) ? `${((asset as any).powerRating).toLocaleString()} kW` : '--'} 
-          icon={<Activity className="w-5 h-5" />} 
+        <KPICard
+          title="Energy Capacity"
+          value={energyCapacityDisplay}
+          icon={<Zap className="w-5 h-5" />}
         />
-        <KPICard 
-          title="Parent Site" 
-          value={site ? site.name : 'Unknown'} 
-          icon={<ChevronRight className="w-5 h-5" />} 
+        <KPICard
+          title="Power Rating"
+          value={powerRatingDisplay}
+          icon={<Activity className="w-5 h-5" />}
+        />
+        <KPICard
+          title="Parent Site"
+          value={site ? site.name : 'Unknown'}
+          icon={<ChevronRight className="w-5 h-5" />}
         />
       </div>
 
@@ -201,7 +240,7 @@ export default function BESSAssetDetailsPage() {
               <div>
                 <p className="text-sm font-medium text-slate-500 uppercase tracking-wider">Active Power</p>
                 <p className="text-3xl font-bold text-slate-900 mt-1">
-                  {telemetry?.bessPower !== undefined && telemetry.bessPower > 0 ? '+' : ''}{telemetry?.bessPower ?? '--'} kW
+                  {activePowerDisplay}
                 </p>
               </div>
               <div className="text-right">
@@ -230,11 +269,11 @@ export default function BESSAssetDetailsPage() {
               </div>
               <div className="bg-slate-50 p-3 rounded-lg border border-slate-100">
                 <p className="text-xs font-medium text-slate-500">Today Charge/Discharge</p>
-                <p className="text-lg font-bold text-slate-900">{telemetry?.todayChargeEnergy ?? '--'} / {telemetry?.todayDischargeEnergy ?? '--'} kWh</p>
+                <p className="text-lg font-bold text-slate-900">{todayChargeFmt.displayValue} / {todayDischargeFmt.displayValue} {todayChargeFmt.unit}</p>
               </div>
               <div className="bg-slate-50 p-3 rounded-lg border border-slate-100">
                 <p className="text-xs font-medium text-slate-500">Acc Charge/Discharge</p>
-                <p className="text-lg font-bold text-slate-900">{telemetry?.accChargeEnergy ?? '--'} / {telemetry?.accDischargeEnergy ?? '--'} kWh</p>
+                <p className="text-lg font-bold text-slate-900">{accChargeFmt.displayValue} / {accDischargeFmt.displayValue} {accChargeFmt.unit}</p>
               </div>
             </div>
           </div>
@@ -268,7 +307,7 @@ export default function BESSAssetDetailsPage() {
                   {/* Connection line */}
                   <div className="absolute -left-8 top-1/2 w-8 border-t-2 border-slate-200"></div>
                   
-                  <div className="flex items-center justify-between bg-slate-50 border border-slate-200 rounded-lg p-4 hover:border-slate-300 transition-colors">
+                  <div className="flex items-center justify-between bg-slate-50 border border-slate-200 rounded-lg p-4">
                     <div className="flex items-center gap-4">
                       <div className="w-10 h-10 rounded-lg bg-white border border-slate-200 flex items-center justify-center text-slate-500 shrink-0 shadow-sm">
                         <Cpu className="w-5 h-5" />

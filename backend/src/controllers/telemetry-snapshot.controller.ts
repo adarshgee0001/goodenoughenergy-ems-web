@@ -97,42 +97,156 @@ export const getSiteTelemetrySnapshots = async (req: Request, res: Response, nex
     }
 
     // 5. Query
-    const snapshots = await prisma.telemetrySnapshot15m.findMany({
-      where: whereClause,
-      orderBy: { bucketTimestamp: 'asc' },
-      take,
-      skip
+    const siteBesses = await prisma.bESSAsset.findMany({
+      where: { siteId },
+      select: { id: true }
     });
+    const isMultiBess = !bessAssetId && siteBesses.length > 1;
 
-    const total = await prisma.telemetrySnapshot15m.count({ where: whereClause });
+    let snapshots: any[];
+    let total: number;
+
+    if (isMultiBess) {
+      const aggRows: any[] = await prisma.$queryRawUnsafe(`
+        WITH DistinctSnapshots AS (
+          SELECT DISTINCT ON (s."bessAssetId", s."bucketTimestamp")
+            s."bessAssetId",
+            s."bucketTimestamp",
+            s."pcsActivePower",
+            s."soc",
+            s."gridSideLoad",
+            s."solarPower",
+            s."totalPower",
+            s."dcVoltage",
+            s."ambientTemp",
+            s."bmsCurrent",
+            s."powerFactor",
+            s."bessFrequency",
+            s."bessPowerFactor",
+            s."todayChargeEnergy",
+            s."todayDischargeEnergy",
+            s."accumChargeEnergy",
+            s."accumDischargeEnergy",
+            s."createdAt"
+          FROM "TelemetrySnapshot15m" s
+          JOIN "BESSAsset" b ON s."bessAssetId" = b."id"
+          WHERE b."siteId" = '${siteId}'
+            AND s."bucketTimestamp" >= '${parsedFrom.toISOString()}'::timestamp
+            AND s."bucketTimestamp" < '${parsedTo.toISOString()}'::timestamp
+          ORDER BY s."bessAssetId", s."bucketTimestamp", s."createdAt" DESC
+        )
+        SELECT
+          'agg-' || date_bin('15 minutes'::interval, "bucketTimestamp", '2000-01-01 00:00:00Z') AS "id",
+          'all' AS "bessAssetId",
+          date_bin('15 minutes'::interval, "bucketTimestamp", '2000-01-01 00:00:00Z') AS "bucketTimestamp",
+          (array_agg("gridSideLoad" ORDER BY "createdAt" DESC) FILTER (WHERE "gridSideLoad" IS NOT NULL))[1] AS "gridSideLoad",
+          CASE WHEN COUNT("pcsActivePower") > 0 THEN SUM("pcsActivePower") ELSE NULL END AS "pcsActivePower",
+          CASE WHEN COUNT("soc") > 0 THEN AVG("soc") ELSE NULL END AS "soc",
+          (array_agg("solarPower" ORDER BY "createdAt" DESC) FILTER (WHERE "solarPower" IS NOT NULL))[1] AS "solarPower",
+          AVG("powerFactor") AS "powerFactor",
+          AVG("bessFrequency") AS "bessFrequency",
+          AVG("bessPowerFactor") AS "bessPowerFactor",
+          SUM("totalPower") AS "totalPower",
+          AVG("dcVoltage") AS "dcVoltage",
+          MAX("ambientTemp") AS "ambientTemp",
+          SUM("bmsCurrent") AS "bmsCurrent",
+          SUM("todayChargeEnergy") AS "todayChargeEnergy",
+          SUM("todayDischargeEnergy") AS "todayDischargeEnergy",
+          SUM("accumChargeEnergy") AS "accumChargeEnergy",
+          SUM("accumDischargeEnergy") AS "accumDischargeEnergy"
+        FROM DistinctSnapshots
+        GROUP BY date_bin('15 minutes'::interval, "bucketTimestamp", '2000-01-01 00:00:00Z')
+        ORDER BY "bucketTimestamp" ASC
+        LIMIT ${take} OFFSET ${skip}
+      `);
+
+      snapshots = aggRows;
+
+      const countRes: any = await prisma.$queryRawUnsafe(`
+        SELECT CAST(COUNT(DISTINCT date_bin('15 minutes'::interval, s."bucketTimestamp", '2000-01-01 00:00:00Z')) AS INTEGER) as total
+        FROM "TelemetrySnapshot15m" s
+        JOIN "BESSAsset" b ON s."bessAssetId" = b."id"
+        WHERE b."siteId" = '${siteId}'
+          AND s."bucketTimestamp" >= '${parsedFrom.toISOString()}'::timestamp
+          AND s."bucketTimestamp" < '${parsedTo.toISOString()}'::timestamp
+      `);
+      total = countRes[0]?.total || 0;
+    } else {
+      snapshots = await prisma.telemetrySnapshot15m.findMany({
+        where: whereClause,
+        orderBy: { bucketTimestamp: 'asc' },
+        take,
+        skip
+      });
+      total = await prisma.telemetrySnapshot15m.count({ where: whereClause });
+    }
 
     // Summary Calculation
     let summary = null;
     if (from || to) {
-      const firstSnapshot = await prisma.telemetrySnapshot15m.findFirst({
-        where: whereClause,
-        orderBy: { bucketTimestamp: 'asc' },
-      });
+      if (bessAssetId || siteBesses.length <= 1) {
+        const firstSnapshot = await prisma.telemetrySnapshot15m.findFirst({
+          where: whereClause,
+          orderBy: { bucketTimestamp: 'asc' },
+        });
 
-      const lastSnapshot = await prisma.telemetrySnapshot15m.findFirst({
-        where: whereClause,
-        orderBy: { bucketTimestamp: 'desc' },
-      });
+        const lastSnapshot = await prisma.telemetrySnapshot15m.findFirst({
+          where: whereClause,
+          orderBy: { bucketTimestamp: 'desc' },
+        });
 
-      const chargeDifference =
-        firstSnapshot?.accumChargeEnergy != null && lastSnapshot?.accumChargeEnergy != null
-          ? lastSnapshot.accumChargeEnergy - firstSnapshot.accumChargeEnergy
-          : null;
+        const chargeDifference =
+          firstSnapshot?.accumChargeEnergy != null && lastSnapshot?.accumChargeEnergy != null
+            ? lastSnapshot.accumChargeEnergy - firstSnapshot.accumChargeEnergy
+            : null;
 
-      const dischargeDifference =
-        firstSnapshot?.accumDischargeEnergy != null && lastSnapshot?.accumDischargeEnergy != null
-          ? lastSnapshot.accumDischargeEnergy - firstSnapshot.accumDischargeEnergy
-          : null;
+        const dischargeDifference =
+          firstSnapshot?.accumDischargeEnergy != null && lastSnapshot?.accumDischargeEnergy != null
+            ? lastSnapshot.accumDischargeEnergy - firstSnapshot.accumDischargeEnergy
+            : null;
 
-      summary = {
-        chargeDifference,
-        dischargeDifference,
-      };
+        summary = {
+          chargeDifference,
+          dischargeDifference,
+        };
+      } else {
+        // Multi-BESS site overview: calculate differences per BESS, then sum valid differences
+        let totalChargeDiff = 0;
+        let totalDischargeDiff = 0;
+        let hasValidCharge = false;
+        let hasValidDischarge = false;
+
+        for (const bess of siteBesses) {
+          const first = await prisma.telemetrySnapshot15m.findFirst({
+            where: {
+              bessAssetId: bess.id,
+              bucketTimestamp: whereClause.bucketTimestamp
+            },
+            orderBy: { bucketTimestamp: 'asc' }
+          });
+          const last = await prisma.telemetrySnapshot15m.findFirst({
+            where: {
+              bessAssetId: bess.id,
+              bucketTimestamp: whereClause.bucketTimestamp
+            },
+            orderBy: { bucketTimestamp: 'desc' }
+          });
+
+          if (first?.accumChargeEnergy != null && last?.accumChargeEnergy != null) {
+            totalChargeDiff += (last.accumChargeEnergy - first.accumChargeEnergy);
+            hasValidCharge = true;
+          }
+          if (first?.accumDischargeEnergy != null && last?.accumDischargeEnergy != null) {
+            totalDischargeDiff += (last.accumDischargeEnergy - first.accumDischargeEnergy);
+            hasValidDischarge = true;
+          }
+        }
+
+        summary = {
+          chargeDifference: hasValidCharge ? totalChargeDiff : null,
+          dischargeDifference: hasValidDischarge ? totalDischargeDiff : null
+        };
+      }
     }
 
     // 6. Return response

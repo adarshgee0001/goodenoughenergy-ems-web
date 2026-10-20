@@ -284,6 +284,46 @@ describe('test-assets.ts', () => {
     });
     assert(res.status === 409, 'Device Mapping: Update duplicate mapping -> 409');
 
+    // Update name
+    res = await fetch(`${baseUrl}/devices/device-A`, { 
+      method: 'PATCH', headers: adminHeaders, 
+      body: JSON.stringify({ name: 'Battery Management Systemssss' }) 
+    });
+    assert(res.status === 200, 'Device Mapping: Update valid name -> 200');
+    data = await res.json();
+    assert(data.device.name === 'Battery Management Systemssss', 'Device Mapping: Response contains updated name');
+
+    // Update name alongside hardwareId and componentId
+    res = await fetch(`${baseUrl}/devices/device-A`, { 
+      method: 'PATCH', headers: adminHeaders, 
+      body: JSON.stringify({ name: '  BMS Primary  ', componentId: 'bcms-main', hardwareId: 'hw-bms-1' }) 
+    });
+    assert(res.status === 200, 'Device Mapping: Update name with componentId & hardwareId -> 200');
+    data = await res.json();
+    assert(data.device.name === 'BMS Primary', 'Device Mapping: Trimmed name updated');
+    assert(data.device.componentId === 'bcms-main', 'Device Mapping: componentId updated');
+    assert(data.device.hardwareId === 'hw-bms-1', 'Device Mapping: hardwareId updated');
+
+    // Clear name with null
+    res = await fetch(`${baseUrl}/devices/device-A`, { 
+      method: 'PATCH', headers: adminHeaders, 
+      body: JSON.stringify({ name: null }) 
+    });
+    assert(res.status === 200, 'Device Mapping: Clear name with null -> 200');
+    data = await res.json();
+    assert(data.device.name === null, 'Device Mapping: Name cleared to null in response');
+
+    // Partial update omitting name preserves existing name
+    (mockDevices.find(d => d.id === 'device-A') as any).name = 'Preserved BMS';
+    res = await fetch(`${baseUrl}/devices/device-A`, { 
+      method: 'PATCH', headers: adminHeaders, 
+      body: JSON.stringify({ componentId: 'comp-partial' }) 
+    });
+    assert(res.status === 200, 'Device Mapping: Partial update omitting name -> 200');
+    data = await res.json();
+    assert(data.device.name === 'Preserved BMS', 'Device Mapping: Omitted name preserved in partial update');
+    assert(data.device.componentId === 'comp-partial', 'Device Mapping: componentId updated in partial update');
+
   } finally {
     server.close();
     

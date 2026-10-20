@@ -3,6 +3,10 @@ import { webSocketService, LiveTelemetryPayload } from './websocket.service';
 import { alarmIngestionService } from './alarm-ingestion.service';
 
 import { prisma } from '../db/prisma';
+import { calculatePackTemperatures, isRecognizedPackTemperatureSignal } from '../utils/battery-status.util';
+import { calculateLineVoltage, calculateAcCurrent, getPcsTemperature, getTmsAmbientTemperature } from '../utils/pcs-telemetry.util';
+import { normalizeCabinetState } from '../utils/bms-telemetry.util';
+import { normalizeTmsMode } from '../utils/tms-telemetry.util';
 
 // ---------------------------------------------------------------------------
 // Signal Normalization
@@ -111,6 +115,24 @@ export interface NormalizedTelemetry {
     cellVMax?: number;
     cellVMin?: number;
     cellTempMax?: number;
+    cellTempMin?: number;        // bcms.ai_min_temp
+    bmsDcVoltage?: number;       // bcms.ai_sum_u
+    bmsCabinetState?: number;    // bcms.di_rcdhg_stat
+    // Battery Status & Ambient
+    batteryAmbientTemp?: number;  // th.ai_temp
+    packAvgTemp?: number;         // pack_* average temperature
+    packMaxTemp?: number;         // pack_* maximum temperature
+    // PCS Telemetry Table (Phase 1) & TMS Ambient Temp
+    pcsTemperature?: number;      // pcs.ai_igbt_temp
+    pcsLineVoltage?: number;      // pcs avg(ai_out_uab, ai_out_ubc, ai_out_uca)
+    pcsAcCurrent?: number;        // pcs avg(ai_ia, ai_ib, ai_ic)
+    tmsAmbientTemp?: number;      // tms.ai_at
+    // TMS Telemetry Table
+    tmsOperatingMode?: number;         // tms.di_singco_state
+    tmsCoolantReturnTemp?: number;     // tms.ai_iw_temp (°C)
+    tmsCoolantInletTemp?: number;      // tms.ai_ow_temp (°C)
+    tmsCoolantReturnPressure?: number; // tms.ai_iw_prs (bar)
+    tmsCoolantInletPressure?: number;  // tms.ai_ow_prs (bar)
   };
 }
 
@@ -224,6 +246,27 @@ export function normalizeComponentSignals(
     result.bessPowerFactor = get('ai_cos'); // Source: pcs.ai_cos → BESS/PCS Power Factor
     result.wsData.bessPowerFactor = result.bessPowerFactor;
 
+    // PCS Temperature: strictly pcs.ai_igbt_temp (no fallback to ai_temp or ai_ta)
+    const pcsAiTemp = getPcsTemperature(get('ai_igbt_temp'));
+    if (pcsAiTemp !== undefined) {
+      result.wsData.pcsTemperature = pcsAiTemp;
+    }
+
+    // PCS Line Voltage: arithmetic mean of ai_out_uab, ai_out_ubc, ai_out_uca
+    const lineVolt = calculateLineVoltage(bessUab, bessUbc, bessUca);
+    if (lineVolt !== undefined) {
+      result.wsData.pcsLineVoltage = lineVolt;
+    }
+
+    // PCS AC Current: arithmetic mean of ai_ia, ai_ib, ai_ic
+    const ia = get('ai_ia');
+    const ib = get('ai_ib');
+    const ic = get('ai_ic');
+    const acCurr = calculateAcCurrent(ia, ib, ic);
+    if (acCurr !== undefined) {
+      result.wsData.pcsAcCurrent = acCurr;
+    }
+
     // NOTE: pcs.ai_sum_p is NOT extracted — it does not appear in the Old Dashboard
     // PCS signal reference and MUST NOT be treated as gridSideLoad.
     return result;
@@ -287,23 +330,49 @@ export function normalizeComponentSignals(
   // BMS — componentId === "bcms"
   // -------------------------------------------------------------------------
   if (componentId === 'bcms') {
-    result.soc = get('ai_sum_soc');
+    const getNumeric = (name: string): number | undefined => {
+      const v = sigMap.get(name);
+      if (v === undefined || v === null) return undefined;
+      if (typeof v === 'string' && v.trim() === '') return undefined;
+      const num = Number(v);
+      return Number.isFinite(num) ? num : undefined;
+    };
+
+    result.soc = getNumeric('ai_sum_soc');
     result.wsData.bessSoc = result.soc;
 
-    result.soh = get('ai_sum_soh');
+    result.soh = getNumeric('ai_sum_soh');
     result.wsData.bmsSoh = result.soh;
 
-    result.bmsCurrent = get('ai_sum_i');
+    result.bmsCurrent = getNumeric('ai_sum_i');
     result.wsData.bmsCurrent = result.bmsCurrent;
 
-    result.cellVMax = get('ai_max_cell_vol');
+    result.cellVMax = getNumeric('ai_max_cell_vol');
     result.wsData.cellVMax = result.cellVMax;
 
-    result.cellVMin = get('ai_min_vol');
+    result.cellVMin = getNumeric('ai_min_vol');
     result.wsData.cellVMin = result.cellVMin;
 
-    result.cellTempMax = get('ai_max_temp');
+    result.cellTempMax = getNumeric('ai_max_temp');
     result.wsData.cellTempMax = result.cellTempMax;
+
+    const minTemp = getNumeric('ai_min_temp');
+    if (minTemp !== undefined) {
+      result.wsData.cellTempMin = minTemp;
+    }
+
+    const bmsDcVolt = getNumeric('ai_sum_u');
+    if (bmsDcVolt !== undefined) {
+      result.wsData.bmsDcVoltage = bmsDcVolt;
+    }
+
+    const rawCabinetState = sigMap.get('di_rcdhg_stat');
+    if (rawCabinetState !== undefined) {
+      const normState = normalizeCabinetState(rawCabinetState);
+      if (normState !== undefined) {
+        result.wsData.bmsCabinetState = normState;
+      }
+    }
 
     return result;
   }
@@ -326,7 +395,94 @@ export function normalizeComponentSignals(
   }
 
   // -------------------------------------------------------------------------
-  // All other components (tms, th, io, ecu, pack_*, bc_*, bmu_*, etc.)
+  // Temperature & Humidity Sensor — componentId === "th"
+  // Confirmed mapping: ai_temp → Battery Ambient Temperature (°C)
+  // Preserves pcs.ambientTemp untouched; does NOT write to result.ambientTemp.
+  // -------------------------------------------------------------------------
+  if (componentId === 'th') {
+    const ambient = get('ai_temp');
+    if (ambient !== undefined) {
+      result.wsData.batteryAmbientTemp = ambient;
+    }
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // Thermal Management System — componentId === "tms"
+  // Confirmed mappings:
+  // 1. Operating Mode: tms.di_singco_state (0=STOP, 1=SELF-CIRCULATION, 2=UNKNOWN, 3=HEATING, 4=FAULT)
+  // 2. Ambient Temperature: tms.ai_at (°C)
+  // 3. Battery Coolant Return Temperature: tms.ai_iw_temp (°C)
+  // 4. Battery Coolant Inlet Temperature: tms.ai_ow_temp (°C)
+  // 5. Coolant Return Pressure: tms.ai_iw_prs (bar)
+  // 6. Coolant Inlet Pressure: tms.ai_ow_prs (bar)
+  // -------------------------------------------------------------------------
+  if (componentId === 'tms') {
+    const ambient = getTmsAmbientTemperature(get('ai_at'));
+    if (ambient !== undefined) {
+      result.wsData.tmsAmbientTemp = ambient;
+    }
+
+    const rawMode = sigMap.get('di_singco_state');
+    if (rawMode !== undefined) {
+      const normMode = normalizeTmsMode(rawMode);
+      if (normMode !== undefined) {
+        result.wsData.tmsOperatingMode = normMode;
+      }
+    }
+
+    const iwTemp = get('ai_iw_temp');
+    if (iwTemp !== undefined) {
+      result.wsData.tmsCoolantReturnTemp = iwTemp;
+    }
+
+    const owTemp = get('ai_ow_temp');
+    if (owTemp !== undefined) {
+      result.wsData.tmsCoolantInletTemp = owTemp;
+    }
+
+    const iwPrs = get('ai_iw_prs');
+    if (iwPrs !== undefined) {
+      result.wsData.tmsCoolantReturnPressure = iwPrs;
+    }
+
+    const owPrs = get('ai_ow_prs');
+    if (owPrs !== undefined) {
+      result.wsData.tmsCoolantInletPressure = owPrs;
+    }
+
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // Battery Packs — componentId === "pack_01" .. "pack_05"
+  // Calculates average and maximum temperature using the manager's rule:
+  // - Retains legitimate zeros within active sequence
+  // - Excludes trailing inactive zeros
+  // - Discards malformed/null/NaN without zero-coercion
+  // - Does not invent values for all-zero packs
+  // -------------------------------------------------------------------------
+  if (componentId.startsWith('pack_')) {
+    // Select ONLY recognized temperature signals from verified firmware schema:
+    // - ai_temp_01 .. ai_temp_28 (cell temperature probes)
+    // - ai_negpol_temp, ai_pospol_temp (pole temperatures)
+    // NEVER fall back to averaging arbitrary signals if no temperature signals match.
+    const tempSignals = signals.filter(s => s.m && isRecognizedPackTemperatureSignal(s.m));
+
+    if (tempSignals.length > 0) {
+      const calc = calculatePackTemperatures(tempSignals.map(s => s.v));
+      if (calc.avgTemp !== undefined) {
+        result.wsData.packAvgTemp = calc.avgTemp;
+      }
+      if (calc.maxTemp !== undefined) {
+        result.wsData.packMaxTemp = calc.maxTemp;
+      }
+    }
+    return result;
+  }
+
+  // -------------------------------------------------------------------------
+  // All other components (tms, io, ecu, bc_*, bmu_*, etc.)
   // No named-column mapping in this phase.
   // rawPayload is still preserved in the persistence layer.
   // wsData remains empty for these — frontend reads di_* faults from rawPayload via REST.

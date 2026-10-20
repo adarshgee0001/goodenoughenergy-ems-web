@@ -14,16 +14,7 @@ export const getDynamicReport = async (req: Request, res: Response, next: NextFu
       return;
     }
 
-    if (!intervalMinutes) {
-      res.status(400).json({ success: false, error: { message: 'intervalMinutes is required' } });
-      return;
-    }
-
-    const parsedInterval = parseInt(intervalMinutes as string, 10);
-    if (isNaN(parsedInterval) || parsedInterval < 1 || parsedInterval > 20) {
-      res.status(400).json({ success: false, error: { message: 'intervalMinutes must be an integer between 1 and 20' } });
-      return;
-    }
+    // Authoritative reporting interval resolved from BESSAsset in DB after authorization
 
     // 1. Authorization: resolve site ownership and verify access
     const clientId = await assetService.resolveSiteOwnership(siteId);
@@ -46,6 +37,13 @@ export const getDynamicReport = async (req: Request, res: Response, next: NextFu
         return;
       }
     }
+
+    // 3. Authoritative reporting interval from DB (client query param cannot override)
+    const siteBess = await prisma.bESSAsset.findFirst({
+      where: bessAssetId ? { id: bessAssetId as string, siteId } : { siteId },
+      select: { reportIntervalMinutes: true }
+    });
+    const parsedInterval = siteBess?.reportIntervalMinutes || 15;
 
     let parsedFrom: Date | undefined;
     let parsedTo: Date | undefined;
@@ -109,6 +107,7 @@ export const getDynamicReport = async (req: Request, res: Response, next: NextFu
       success: true,
       data: {
         siteId,
+        intervalMinutes: parsedInterval,
         total: reportData.total,
         limit: take,
         offset: skip,

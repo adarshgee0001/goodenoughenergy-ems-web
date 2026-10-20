@@ -3,8 +3,13 @@ import type { User, LoginCredentials } from './auth.types';
 // Backend API base URL — falls back to localhost:5000 for development
 import { API_BASE } from '../../utils/apiClient';
 
+export interface LoginResponse {
+  user: User;
+  expiresAt?: number;
+}
+
 export const authService = {
-  login: async (credentials: LoginCredentials): Promise<User> => {
+  login: async (credentials: LoginCredentials): Promise<LoginResponse> => {
     const { email, password } = credentials;
 
     let response: Response;
@@ -36,7 +41,7 @@ export const authService = {
       throw new Error('Unexpected server response. Please try again.');
     }
 
-    // Return only the safe user profile; AuthContext/authStorage will persist it
+    // Return the safe user profile and backend-authoritative expiresAt timestamp
     const user: User = {
       id: data.user.id,
       name: data.user.name,
@@ -45,7 +50,10 @@ export const authService = {
       forcePasswordChange: data.user.forcePasswordChange,
     };
 
-    return user;
+    return {
+      user,
+      expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : undefined,
+    };
   },
 
   logout: async (): Promise<void> => {

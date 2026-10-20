@@ -26,7 +26,7 @@ export const homeFaqs: FAQItem[] = [
   },
   {
     question: "Does the system provide real-time monitoring?",
-    answer: "Yes, the GoodEnough Energy EMS provides deep, real-time telemetry, offering instant visibility into state-of-charge, power flows, and asset health."
+    answer: "Yes, Storage.ai provides deep, real-time telemetry, offering instant visibility into state-of-charge, power flows, and asset health."
   }
 ];
 

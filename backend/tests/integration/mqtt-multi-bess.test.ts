@@ -109,7 +109,8 @@ describe('MQTT Multi-BESS Support', () => {
     
     expect(telemetry1.length).toBe(1);
     expect(telemetry1[0].pcsActivePower).toBe(150.5);
-    expect(telemetry1[0].gridFrequency).toBe(49.97);
+    expect(telemetry1[0].bessFrequency).toBe(49.97);
+    expect(telemetry1[0].gridFrequency).toBeNull();
 
     // Verify Telemetry for BESS 2
     const telemetry2 = await prisma.telemetryHistory.findMany({
@@ -118,6 +119,7 @@ describe('MQTT Multi-BESS Support', () => {
     
     expect(telemetry2.length).toBe(1);
     expect(telemetry2[0].pcsActivePower).toBe(250.5);
-    expect(telemetry2[0].gridFrequency).toBe(50.02);
+    expect(telemetry2[0].bessFrequency).toBe(50.02);
+    expect(telemetry2[0].gridFrequency).toBeNull();
   });
 });

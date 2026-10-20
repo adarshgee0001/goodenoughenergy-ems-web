@@ -116,8 +116,9 @@ model BESSAsset {
   emuId           String?  @unique
   mqttTopic       String?  @unique
   energyCapacity  Float?
-  powerRating     Float?
-  createdAt       DateTime @default(now())
+  powerRating           Float?
+  reportIntervalMinutes Int      @default(15)
+  createdAt             DateTime @default(now())
   updatedAt       DateTime @updatedAt
   siteId          String
 

@@ -63,7 +63,7 @@ export const bessService = {
     return data.asset;
   },
 
-  createBess: async (siteId: string, name: string, assetIdentifier: string, emuId?: string | null, model?: string, energyCapacity?: number | string, powerRating?: number | string, mqttTopic?: string | null): Promise<BessAsset> => {
+  createBess: async (siteId: string, name: string, assetIdentifier: string, emuId?: string | null, model?: string, energyCapacity?: number | string, powerRating?: number | string, mqttTopic?: string | null, reportIntervalMinutes?: number): Promise<BessAsset> => {
 
     const payload: any = { 
       name: name.trim(), 
@@ -75,6 +75,7 @@ export const bessService = {
     if (energyCapacity !== undefined && energyCapacity !== '') payload.energyCapacity = energyCapacity;
     if (powerRating !== undefined && powerRating !== '') payload.powerRating = powerRating;
     if (mqttTopic !== undefined) payload.mqttTopic = mqttTopic;
+    if (reportIntervalMinutes !== undefined) payload.reportIntervalMinutes = reportIntervalMinutes;
 
     const response = await authenticatedFetch(`${API_BASE}/api/sites/${siteId}/bess`, {
       method: 'POST',
@@ -100,7 +101,7 @@ export const bessService = {
     return data.asset;
   },
 
-  updateBess: async (assetId: string, name: string, assetIdentifier: string, emuId?: string | null, model?: string, energyCapacity?: number | string, powerRating?: number | string, mqttTopic?: string | null): Promise<BessAsset> => {
+  updateBess: async (assetId: string, name: string, assetIdentifier: string, emuId?: string | null, model?: string, energyCapacity?: number | string, powerRating?: number | string, mqttTopic?: string | null, reportIntervalMinutes?: number): Promise<BessAsset> => {
 
     const payload: any = { 
       name: name.trim(), 
@@ -112,6 +113,7 @@ export const bessService = {
     if (energyCapacity !== undefined) payload.energyCapacity = energyCapacity === '' ? null : energyCapacity;
     if (powerRating !== undefined) payload.powerRating = powerRating === '' ? null : powerRating;
     if (mqttTopic !== undefined) payload.mqttTopic = mqttTopic;
+    if (reportIntervalMinutes !== undefined) payload.reportIntervalMinutes = reportIntervalMinutes;
 
     const response = await authenticatedFetch(`${API_BASE}/api/bess/${assetId}`, {
       method: 'PATCH',

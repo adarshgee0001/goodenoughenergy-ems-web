@@ -117,7 +117,7 @@ export class TelemetrySnapshotService {
     return upsertCount;
   }
 
-  private aggregateBucket(bessAssetId: string, bucketStart: Date, rows: (TelemetryHistory & { device: { componentId: string | null } })[]) {
+  public aggregateBucket(bessAssetId: string, bucketStart: Date, rows: (TelemetryHistory & { device: { componentId: string | null } })[]) {
     // Split rows by verified component sources
     const meterRows = rows.filter(r => r.device.componentId === 'rjl' || r.device.componentId === 'jl');
     const pcsRows = rows.filter(r => r.device.componentId === 'pcs');
@@ -147,13 +147,13 @@ export class TelemetrySnapshotService {
       currentB: avg(meterRows.map(r => r.currentB)),
       currentC: avg(meterRows.map(r => r.currentC)),
       totalPower: avg(meterRows.map(r => r.totalPower)),
-      bessFrequency: avg(meterRows.map(r => (r as any).bessFrequency ?? null)),
-      bessPowerFactor: avg(meterRows.map(r => (r as any).bessPowerFactor ?? null)),
 
       // PCS
       pcsActivePower: avg(pcsRows.map(r => r.pcsActivePower)),
       dcVoltage: avg(pcsRows.map(r => r.dcVoltage)),
       ambientTemp: avg(pcsRows.map(r => r.ambientTemp)),
+      bessFrequency: avg(pcsRows.map(r => (r as any).bessFrequency ?? null)),
+      bessPowerFactor: avg(pcsRows.map(r => (r as any).bessPowerFactor ?? null)),
       todayChargeEnergy: latestValid(pcsRows, 'todayChargeEnergy'),
       todayDischargeEnergy: latestValid(pcsRows, 'todayDischargeEnergy'),
       accumChargeEnergy: latestValid(pcsRows, 'accumChargeEnergy'),

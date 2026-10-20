@@ -23,7 +23,12 @@ export function AdminSidebar({ isOpen, closeSidebar }: { isOpen: boolean; closeS
         lg:static lg:translate-x-0
         ${isOpen ? 'translate-x-0' : '-translate-x-full'}
       `}>
-        <div className="h-16 flex items-center px-6 border-b border-slate-800 shrink-0">
+        <div className="h-16 flex items-center px-6 border-b border-slate-800 shrink-0 gap-3">
+          <img
+            src="/Favgee.png"
+            alt="GoodEnough Energy Logo"
+            className="h-7 w-auto object-contain shrink-0"
+          />
           <span className="text-xl font-bold text-white tracking-tight">Admin Console</span>
         </div>
         
@@ -35,9 +40,9 @@ export function AdminSidebar({ isOpen, closeSidebar }: { isOpen: boolean; closeS
               end={item.exact}
               onClick={closeSidebar}
               className={({ isActive }) => `
-                flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors font-medium text-sm
+                flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors duration-150 ease-out font-medium text-sm focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-primary-500
                 ${isActive 
-                  ? 'bg-primary-600 text-white' 
+                  ? 'bg-primary-600 text-white shadow-xs' 
                   : 'hover:bg-slate-800 hover:text-white'}
               `}
             >
@@ -47,8 +52,13 @@ export function AdminSidebar({ isOpen, closeSidebar }: { isOpen: boolean; closeS
           ))}
         </div>
         
-        <div className="p-4 border-t border-slate-800 shrink-0 text-xs text-slate-500">
-          v1.0.0 (Admin)
+        <div className="p-4 border-t border-slate-800 shrink-0 flex items-center justify-between text-xs text-slate-500">
+          <span>v1.0.0 (Admin)</span>
+          <img
+            src="/Favgee.png"
+            alt="GoodEnough Energy Logo"
+            className="h-4 w-auto object-contain opacity-75 shrink-0"
+          />
         </div>
       </aside>
     </>

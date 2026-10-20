@@ -12,6 +12,8 @@
   --color-primary-800: #4c5613;
   --color-primary-900: #262b0a;
 
+  --ease-standard: cubic-bezier(0.16, 1, 0.3, 1);
+
   --font-sans: 'Open Sans', ui-sans-serif, system-ui, sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
 }
 
@@ -22,4 +24,18 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
+
+  /* Keyboard focus visibility standard */
+  :focus-visible {
+    outline: 2px solid var(--color-primary-600, #99ac26);
+    outline-offset: 2px;
+  }
+
+  /* Safe transition override for users preferring reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    *, ::before, ::after {
+      transition-duration: 0.01ms !important;
+    }
+  }
 }
+

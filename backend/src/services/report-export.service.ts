@@ -1,35 +1,166 @@
 import { Response } from 'express';
-import { prisma } from '../db/prisma';
 import ExcelJS from 'exceljs';
+import { prisma } from '../db/prisma';
+import { resolveVoltageTrend, VoltageTrendProcessor } from '../utils/voltage-trend.util';
+import { formatCsvRow, formatSiteTimestamp, formatReportPeriod } from '../utils/csv.util';
+import { processReportBatteryStatusRow } from '../utils/battery-status.util';
+import { processReportPcsRow } from '../utils/pcs-telemetry.util';
+import { processReportBmsRow, formatCabinetState } from '../utils/bms-telemetry.util';
+import { processReportTmsRow, formatTmsMode } from '../utils/tms-telemetry.util';
+
+export const SINGLE_BESS_TELEMETRY_HEADERS = [
+  'Timestamp',
+  'BESS Name',
+  'EMU Serial No.',
+  'Grid Side Load (kW)',
+  'Grid Frequency (Hz)',
+  'Grid Power Factor',
+  'BESS Frequency (Hz)',
+  'BESS Power Factor',
+  'PCS Active Power (kW)',
+  'PCS Temperature (°C)',
+  'Line Voltage (V)',
+  'AC Current (A)',
+  'Operating Mode',
+  'Ambient Temperature (°C)',
+  'Battery Coolant Return Temperature (°C)',
+  'Battery Coolant Inlet Temperature (°C)',
+  'Coolant Return Pressure (bar)',
+  'Coolant Inlet Pressure (bar)',
+  'SOC (%)',
+  'SOH (%)',
+  'BMS Current (A)',
+  'BMS DC Voltage (V)',
+  'Cabinet State',
+  'Cell V Max (V)',
+  'Cell V Min (V)',
+  'Cell Temp Max (°C)',
+  'Cell Temp Min (°C)',
+  'Battery Ambient Temperature (°C)',
+  'Pack 01 Average Temperature (°C)',
+  'Pack 01 Maximum Temperature (°C)',
+  'Pack 02 Average Temperature (°C)',
+  'Pack 02 Maximum Temperature (°C)',
+  'Pack 03 Average Temperature (°C)',
+  'Pack 03 Maximum Temperature (°C)',
+  'Pack 04 Average Temperature (°C)',
+  'Pack 04 Maximum Temperature (°C)',
+  'Pack 05 Average Temperature (°C)',
+  'Pack 05 Maximum Temperature (°C)',
+  'Today Charge Energy (kWh)',
+  'Today Discharge Energy (kWh)',
+  'Accum Charge Energy (kWh)',
+  'Accum Discharge Energy (kWh)',
+  'Solar Power (kW)'
+] as const;
+
+export const AUTHORITATIVE_TELEMETRY_HEADERS = SINGLE_BESS_TELEMETRY_HEADERS;
+
+export type ExportUnitOptions = {
+  powerUnit?: 'kW' | 'MW';
+  energyUnit?: 'kWh' | 'MWh';
+};
+
+export function getAuthoritativeTelemetryHeaders(options?: ExportUnitOptions): string[] {
+  const pUnit = options?.powerUnit === 'MW' ? 'MW' : 'kW';
+  const eUnit = options?.energyUnit === 'MWh' ? 'MWh' : 'kWh';
+  return AUTHORITATIVE_TELEMETRY_HEADERS.map((h) => {
+    if (h.includes('(kW)')) return h.replace('(kW)', `(${pUnit})`);
+    if (h.includes('(kWh)')) return h.replace('(kWh)', `(${eUnit})`);
+    return h;
+  });
+}
+
+export function getSingleBessTelemetryHeaders(options?: ExportUnitOptions): string[] {
+  const pUnit = options?.powerUnit === 'MW' ? 'MW' : 'kW';
+  const eUnit = options?.energyUnit === 'MWh' ? 'MWh' : 'kWh';
+  return SINGLE_BESS_TELEMETRY_HEADERS.map((h) => {
+    if (h.includes('(kW)')) return h.replace('(kW)', `(${pUnit})`);
+    if (h.includes('(kWh)')) return h.replace('(kWh)', `(${eUnit})`);
+    return h;
+  });
+}
+
+export function getExportUnitConverters(options?: ExportUnitOptions) {
+  const powerUnit: 'kW' | 'MW' = options?.powerUnit === 'MW' ? 'MW' : 'kW';
+  const energyUnit: 'kWh' | 'MWh' = options?.energyUnit === 'MWh' ? 'MWh' : 'kWh';
+
+  const convertPower = (v: number | string | null | undefined): number | null => {
+    if (v === null || v === undefined) return null;
+    const num = Number(v);
+    if (isNaN(num)) return null;
+    return powerUnit === 'MW' ? num / 1000 : num;
+  };
+
+  const convertEnergy = (v: number | string | null | undefined): number | null => {
+    if (v === null || v === undefined) return null;
+    const num = Number(v);
+    if (isNaN(num)) return null;
+    return energyUnit === 'MWh' ? num / 1000 : num;
+  };
+
+  return { powerUnit, energyUnit, convertPower, convertEnergy };
+}
+
+/**
+ * Excel worksheet naming constraints:
+ * - Max 31 characters
+ * - Prohibited characters: \ / ? * [ ] :
+ * - Cannot start or end with single quote '
+ * - Cannot be empty
+ * - Must be unique within workbook (case-insensitive)
+ */
+export function sanitizeWorksheetName(rawName: string, fallback = 'BESS'): string {
+  if (!rawName || typeof rawName !== 'string') return fallback;
+  // Replace prohibited characters \ / ? * [ ] : with _
+  let sanitized = rawName.replace(/[\\/?*[\]:]/g, '_').trim();
+  // Strip leading or trailing single quotes
+  sanitized = sanitized.replace(/^'+|'+$/g, '').trim();
+  if (!sanitized) {
+    sanitized = fallback;
+  }
+  if (sanitized.length > 31) {
+    sanitized = sanitized.slice(0, 31).trim();
+    if (!sanitized) sanitized = fallback;
+  }
+  return sanitized;
+}
+
+export function generateBessWorksheetNames(
+  bessAssets: { id: string; name: string }[],
+  reservedNames: string[] = ['Site Summary']
+): Map<string, string> {
+  const result = new Map<string, string>();
+  const usedLowerNames = new Set<string>(reservedNames.map((n) => n.trim().toLowerCase()));
+
+  for (let idx = 0; idx < bessAssets.length; idx++) {
+    const asset = bessAssets[idx];
+    const fallback = `BESS ${idx + 1}`;
+    const base = sanitizeWorksheetName(asset.name, fallback);
+
+    let candidate = base;
+    let counter = 2;
+    while (usedLowerNames.has(candidate.toLowerCase())) {
+      const suffix = ` (${counter})`;
+      const maxBaseLen = 31 - suffix.length;
+      const truncatedBase = base.slice(0, Math.max(1, maxBaseLen)).trim();
+      candidate = `${truncatedBase}${suffix}`;
+      counter++;
+    }
+
+    usedLowerNames.add(candidate.toLowerCase());
+    result.set(asset.id, candidate);
+  }
+
+  return result;
+}
 
 export class ReportExportService {
-  public async generateExcelExport(
-    res: Response,
-    siteId: string,
-    intervalMinutes: number,
-    from: Date | undefined,
-    to: Date | undefined
-  ) {
-    const site = await prisma.site.findUnique({
-      where: { id: siteId },
-      include: { client: true }
-    });
-    if (!site) {
-      throw new Error('Site not found');
-    }
-    const siteTimezone = site.timezone || 'Asia/Kolkata';
-
-    const bessAssets = await prisma.bESSAsset.findMany({
-      where: { siteId },
-      orderBy: { name: 'asc' },
-    });
-
-    if (bessAssets.length === 0) {
-      throw new Error('No BESS assets found for this site.');
-    }
-
-    const intervalStr = `${intervalMinutes} minutes`;
+  private buildDataQuery(siteId: string, intervalStr: string, from?: Date, to?: Date, includeBatteryStatus: boolean = false, bessAssetId?: string) {
     let bessAssetFilter = `d."bessAssetId" IN (SELECT "id" FROM "BESSAsset" WHERE "siteId" = '${siteId}')`;
+    if (bessAssetId) {
+      bessAssetFilter = `d."bessAssetId" = '${bessAssetId}'`;
+    }
 
     let timeFilter = `1=1`;
     if (from) {
@@ -38,6 +169,16 @@ export class ReportExportService {
     if (to) {
       timeFilter += ` AND th."timestamp" < '${to.toISOString()}'::timestamp`;
     }
+
+    const batterySelect = includeBatteryStatus ? `,
+        AVG(CASE WHEN d."componentId" = 'th' THEN
+          ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_temp").v')) #>> '{}')::double precision
+        END) AS "batteryAmbientTemp",
+        (array_agg(th."rawPayload" ORDER BY th."timestamp" DESC) FILTER (WHERE d."componentId" = 'pack_01' AND th."rawPayload" IS NOT NULL)) AS "pack01Payloads",
+        (array_agg(th."rawPayload" ORDER BY th."timestamp" DESC) FILTER (WHERE d."componentId" = 'pack_02' AND th."rawPayload" IS NOT NULL)) AS "pack02Payloads",
+        (array_agg(th."rawPayload" ORDER BY th."timestamp" DESC) FILTER (WHERE d."componentId" = 'pack_03' AND th."rawPayload" IS NOT NULL)) AS "pack03Payloads",
+        (array_agg(th."rawPayload" ORDER BY th."timestamp" DESC) FILTER (WHERE d."componentId" = 'pack_04' AND th."rawPayload" IS NOT NULL)) AS "pack04Payloads",
+        (array_agg(th."rawPayload" ORDER BY th."timestamp" DESC) FILTER (WHERE d."componentId" = 'pack_05' AND th."rawPayload" IS NOT NULL)) AS "pack05Payloads"` : '';
 
     const dataQuery = `
       SELECT
@@ -62,6 +203,7 @@ export class ReportExportService {
         AVG(CASE WHEN d."componentId" = 'pmg' THEN th."powerFactor" END) AS "powerFactor",
         AVG(th."bessFrequency") AS "bessFrequency",
         AVG(th."bessPowerFactor") AS "bessPowerFactor",
+        AVG(th."solarFrequency") AS "solarFrequency",
         MAX(th."cellVMax") AS "cellVMax",
         MAX(th."cellTempMax") AS "cellTempMax",
         MIN(th."cellVMin") AS "cellVMin",
@@ -70,7 +212,62 @@ export class ReportExportService {
         (array_agg(th."accumChargeEnergy" ORDER BY th."timestamp" DESC) FILTER (WHERE th."accumChargeEnergy" IS NOT NULL))[1] AS "accumChargeEnergy",
         (array_agg(th."accumDischargeEnergy" ORDER BY th."timestamp" DESC) FILTER (WHERE th."accumDischargeEnergy" IS NOT NULL))[1] AS "accumDischargeEnergy",
         (array_agg(th."soc" ORDER BY th."timestamp" DESC) FILTER (WHERE th."soc" IS NOT NULL))[1] AS "soc",
-        (array_agg(th."soh" ORDER BY th."timestamp" DESC) FILTER (WHERE th."soh" IS NOT NULL))[1] AS "soh"
+        (array_agg(th."soh" ORDER BY th."timestamp" DESC) FILTER (WHERE th."soh" IS NOT NULL))[1] AS "soh"${batterySelect},
+        AVG(CASE WHEN d."componentId" = 'pcs' THEN
+          ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_igbt_temp").v')) #>> '{}')::double precision
+        END) AS "pcsTemperature",
+        AVG(CASE WHEN d."componentId" = 'pcs'
+                 AND th."bessVoltageUa" IS NOT NULL
+                 AND th."bessVoltageUb" IS NOT NULL
+                 AND th."bessVoltageUc" IS NOT NULL
+            THEN (th."bessVoltageUa" + th."bessVoltageUb" + th."bessVoltageUc") / 3.0
+            WHEN d."componentId" = 'pcs' THEN
+              (
+                ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_out_uab").v')) #>> '{}')::double precision +
+                ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_out_ubc").v')) #>> '{}')::double precision +
+                ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_out_uca").v')) #>> '{}')::double precision
+              ) / 3.0
+        END) AS "pcsLineVoltage",
+        AVG(CASE WHEN d."componentId" = 'pcs' THEN
+          (
+            ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_ia").v')) #>> '{}')::double precision +
+            ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_ib").v')) #>> '{}')::double precision +
+            ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_ic").v')) #>> '{}')::double precision
+          ) / 3.0
+        END) AS "pcsAcCurrent",
+        AVG(CASE WHEN d."componentId" = 'tms' THEN
+          ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_at").v')) #>> '{}')::double precision
+        END) AS "tmsAmbientTemp",
+        (array_agg(
+          CASE WHEN d."componentId" = 'tms' THEN
+            ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "di_singco_state").v')) #>> '{}')::integer
+          END
+          ORDER BY th."timestamp" DESC
+        ) FILTER (WHERE d."componentId" = 'tms' AND (jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "di_singco_state").v')) IS NOT NULL))[1] AS "tmsOperatingMode",
+        AVG(CASE WHEN d."componentId" = 'tms' THEN
+          ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_iw_temp").v')) #>> '{}')::double precision
+        END) AS "tmsCoolantReturnTemp",
+        AVG(CASE WHEN d."componentId" = 'tms' THEN
+          ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_ow_temp").v')) #>> '{}')::double precision
+        END) AS "tmsCoolantInletTemp",
+        AVG(CASE WHEN d."componentId" = 'tms' THEN
+          ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_iw_prs").v')) #>> '{}')::double precision
+        END) AS "tmsCoolantReturnPressure",
+        AVG(CASE WHEN d."componentId" = 'tms' THEN
+          ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_ow_prs").v')) #>> '{}')::double precision
+        END) AS "tmsCoolantInletPressure",
+        AVG(CASE WHEN d."componentId" = 'bcms' THEN
+          ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_sum_u").v')) #>> '{}')::double precision
+        END) AS "bmsDcVoltage",
+        MIN(CASE WHEN d."componentId" = 'bcms' THEN
+          ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "ai_min_temp").v')) #>> '{}')::double precision
+        END) AS "cellTempMin",
+        (array_agg(
+          CASE WHEN d."componentId" = 'bcms' THEN
+            ((jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "di_rcdhg_stat").v')) #>> '{}')::integer
+          END
+          ORDER BY th."timestamp" DESC
+        ) FILTER (WHERE d."componentId" = 'bcms' AND (jsonb_path_query_first(th."rawPayload", '$[*] ? (@.m == "di_rcdhg_stat").v')) IS NOT NULL))[1] AS "bmsCabinetState"
       FROM "TelemetryHistory" th
       JOIN "Device" d ON th."deviceId" = d."id"
       JOIN "BESSAsset" b ON d."bessAssetId" = b."id"
@@ -79,300 +276,839 @@ export class ReportExportService {
       ORDER BY date_bin('${intervalStr}'::interval, th."timestamp", '2000-01-01 00:00:00Z') DESC, b."name" ASC
     `;
 
-    // Initialize Excel streaming workbook
-    const options = {
+    return { dataQuery, bessAssetFilter, timeFilter };
+  }
+
+  public async exportDynamicReport(
+    res: Response,
+    siteId: string,
+    intervalMinutes: number,
+    from: Date | undefined,
+    to: Date | undefined,
+    options?: ExportUnitOptions,
+    bessAssetId?: string
+  ) {
+    const site = await prisma.site.findUnique({
+      where: { id: siteId },
+      include: { client: true }
+    });
+    if (!site) {
+      throw new Error('Site not found');
+    }
+
+    const whereBess: any = { siteId };
+    if (bessAssetId) {
+      whereBess.id = bessAssetId;
+    }
+
+    const bessAssets = await prisma.bESSAsset.findMany({
+      where: whereBess,
+      orderBy: { name: 'asc' },
+    });
+
+    if (bessAssets.length === 0) {
+      throw new Error('No BESS assets found for this site.');
+    }
+
+    const isMultiBESS = !bessAssetId && bessAssets.length > 1;
+
+    if (isMultiBESS) {
+      return this.exportMultiBessExcel(res, siteId, intervalMinutes, from, to, site, bessAssets, options);
+    } else {
+      return this.exportSingleBessCsv(res, siteId, intervalMinutes, from, to, site, bessAssets, options, bessAssetId);
+    }
+  }
+
+  public async exportSingleBessCsv(
+    res: Response,
+    siteId: string,
+    intervalMinutes: number,
+    from: Date | undefined,
+    to: Date | undefined,
+    preloadedSite?: any,
+    preloadedBessAssets?: any[],
+    options?: ExportUnitOptions,
+    bessAssetId?: string
+  ) {
+    const site = preloadedSite || await prisma.site.findUnique({
+      where: { id: siteId },
+      include: { client: true }
+    });
+    if (!site) {
+      throw new Error('Site not found');
+    }
+    const siteTimezone = site.timezone || 'Asia/Kolkata';
+
+    const whereBess: any = { siteId };
+    if (bessAssetId) {
+      whereBess.id = bessAssetId;
+    }
+
+    const bessAssets = preloadedBessAssets || await prisma.bESSAsset.findMany({
+      where: whereBess,
+      orderBy: { name: 'asc' },
+    });
+
+    if (bessAssets.length === 0) {
+      throw new Error('No BESS assets found for this site.');
+    }
+
+    const { powerUnit, energyUnit, convertPower, convertEnergy } = getExportUnitConverters(options);
+
+    const effectiveInterval = intervalMinutes || bessAssets[0]?.reportIntervalMinutes || 15;
+    const intervalStr = `${effectiveInterval} minutes`;
+    const targetBessId = bessAssetId || (bessAssets.length === 1 ? bessAssets[0].id : undefined);
+    const { dataQuery } = this.buildDataQuery(siteId, intervalStr, from, to, true, targetBessId);
+
+    if (typeof res.setHeader === 'function' && !res.headersSent) {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    }
+
+    // Send UTF-8 BOM for Microsoft Excel compatibility
+    res.write('\uFEFF');
+
+    // Common Metadata Headers
+    const reportPeriodStr = formatReportPeriod(from, to, siteTimezone);
+    res.write(formatCsvRow(['EMS Reports Export']));
+    res.write(formatCsvRow(['Client Name:', site.client?.name || 'Unknown Client']));
+    res.write(formatCsvRow(['Site Name:', site.name]));
+    res.write(formatCsvRow(['Site Identifier:', site.businessIdentifier || 'N/A']));
+    res.write(formatCsvRow(['Report Period:', reportPeriodStr]));
+    res.write(formatCsvRow(['Export Interval:', intervalStr]));
+    res.write(formatCsvRow([])); // Blank row 7
+
+    const singleBessRows = await prisma.$queryRawUnsafe(dataQuery) as any[];
+
+    for (const row of singleBessRows) {
+      processReportBatteryStatusRow(row);
+      processReportPcsRow(row);
+      processReportBmsRow(row);
+      processReportTmsRow(row);
+    }
+
+    let firstCharge: number | null = null;
+    let lastCharge: number | null = null;
+    let firstDischarge: number | null = null;
+    let lastDischarge: number | null = null;
+
+    for (let i = 0; i < singleBessRows.length; i++) {
+      if (lastCharge === null && singleBessRows[i].accumChargeEnergy != null) lastCharge = singleBessRows[i].accumChargeEnergy;
+      if (lastDischarge === null && singleBessRows[i].accumDischargeEnergy != null) lastDischarge = singleBessRows[i].accumDischargeEnergy;
+      if (lastCharge !== null && lastDischarge !== null) break;
+    }
+
+    for (let i = singleBessRows.length - 1; i >= 0; i--) {
+      if (firstCharge === null && singleBessRows[i].accumChargeEnergy != null) firstCharge = singleBessRows[i].accumChargeEnergy;
+      if (firstDischarge === null && singleBessRows[i].accumDischargeEnergy != null) firstDischarge = singleBessRows[i].accumDischargeEnergy;
+      if (firstCharge !== null && firstDischarge !== null) break;
+    }
+
+    const round2 = (n: number | null): number | null => (n != null ? Math.round(n * 100) / 100 : null);
+    const rawChargeDiff = (firstCharge != null && lastCharge != null) ? (lastCharge - firstCharge) : null;
+    const rawDischargeDiff = (firstDischarge != null && lastDischarge != null) ? (lastDischarge - firstDischarge) : null;
+    const chargeDiff = rawChargeDiff != null ? round2(convertEnergy(rawChargeDiff)) : null;
+    const dischargeDiff = rawDischargeDiff != null ? round2(convertEnergy(rawDischargeDiff)) : null;
+
+    res.write(formatCsvRow([`Total Charge Difference (${energyUnit})`, chargeDiff != null ? chargeDiff : '']));
+    res.write(formatCsvRow([`Total Discharge Difference (${energyUnit})`, dischargeDiff != null ? dischargeDiff : '']));
+    res.write(formatCsvRow([])); // Blank row 9
+
+    const headers = getSingleBessTelemetryHeaders({ powerUnit, energyUnit });
+    res.write(formatCsvRow(headers)); // Row 10: Column headers
+
+    const format2Dec = (v: any) => {
+      if (v === null || v === undefined) return '';
+      const num = Number(v);
+      if (isNaN(num)) return v;
+      return Math.round(num * 100) / 100;
+    };
+
+    const format3Dec = (v: any) => {
+      if (v === null || v === undefined) return '';
+      const num = Number(v);
+      if (isNaN(num)) return v;
+      return Math.round(num * 1000) / 1000;
+    };
+
+    for (const row of singleBessRows) {
+      const bucketTime = row.bucketTimestamp instanceof Date ? row.bucketTimestamp : new Date(row.bucketTimestamp);
+      const formattedTime = formatSiteTimestamp(bucketTime, siteTimezone);
+
+      const dataRow = [
+        formattedTime,
+        row.bessName,
+        row.emuId,
+        format2Dec(convertPower(row.gridSideLoad)),
+        format2Dec(row.gridFrequency),
+        format2Dec(row.powerFactor),
+        format2Dec(row.bessFrequency),
+        format2Dec(row.bessPowerFactor),
+        format2Dec(convertPower(row.pcsActivePower)),
+        format2Dec(row.pcsTemperature),
+        format2Dec(row.pcsLineVoltage),
+        format2Dec(row.pcsAcCurrent),
+        formatTmsMode(row.tmsOperatingMode),
+        format2Dec(row.tmsAmbientTemp),
+        format2Dec(row.tmsCoolantReturnTemp),
+        format2Dec(row.tmsCoolantInletTemp),
+        format2Dec(row.tmsCoolantReturnPressure),
+        format2Dec(row.tmsCoolantInletPressure),
+        format2Dec(row.soc),
+        format2Dec(row.soh),
+        format2Dec(row.bmsCurrent),
+        format2Dec(row.bmsDcVoltage),
+        formatCabinetState(row.bmsCabinetState),
+        format3Dec(row.cellVMax),
+        format3Dec(row.cellVMin),
+        format2Dec(row.cellTempMax),
+        format2Dec(row.cellTempMin),
+        format2Dec(row.batteryAmbientTemp),
+        format2Dec(row.pack01AvgTemp),
+        format2Dec(row.pack01MaxTemp),
+        format2Dec(row.pack02AvgTemp),
+        format2Dec(row.pack02MaxTemp),
+        format2Dec(row.pack03AvgTemp),
+        format2Dec(row.pack03MaxTemp),
+        format2Dec(row.pack04AvgTemp),
+        format2Dec(row.pack04MaxTemp),
+        format2Dec(row.pack05AvgTemp),
+        format2Dec(row.pack05MaxTemp),
+        format2Dec(convertEnergy(row.todayChargeEnergy)),
+        format2Dec(convertEnergy(row.todayDischargeEnergy)),
+        format2Dec(convertEnergy(row.accumChargeEnergy)),
+        format2Dec(convertEnergy(row.accumDischargeEnergy)),
+        format2Dec(convertPower(row.solarPower))
+      ];
+      res.write(formatCsvRow(dataRow));
+    }
+
+    res.end();
+  }
+
+  public async exportMultiBessExcel(
+    res: Response,
+    siteId: string,
+    intervalMinutes: number,
+    from: Date | undefined,
+    to: Date | undefined,
+    preloadedSite?: any,
+    preloadedBessAssets?: any[],
+    options?: ExportUnitOptions
+  ) {
+    const site = preloadedSite || await prisma.site.findUnique({
+      where: { id: siteId },
+      include: { client: true }
+    });
+    if (!site) {
+      throw new Error('Site not found');
+    }
+    const siteTimezone = site.timezone || 'Asia/Kolkata';
+
+    const bessAssets = preloadedBessAssets || await prisma.bESSAsset.findMany({
+      where: { siteId },
+      orderBy: { name: 'asc' },
+    });
+
+    if (bessAssets.length === 0) {
+      throw new Error('No BESS assets found for this site.');
+    }
+
+    const { powerUnit, energyUnit, convertPower, convertEnergy } = getExportUnitConverters(options);
+
+    const effectiveInterval = intervalMinutes || bessAssets[0]?.reportIntervalMinutes || 15;
+    const intervalStr = `${effectiveInterval} minutes`;
+    const { dataQuery, bessAssetFilter, timeFilter } = this.buildDataQuery(siteId, intervalStr, from, to, true);
+
+    if (typeof res.setHeader === 'function' && !res.headersSent) {
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    }
+
+    const workbookOptions = {
       stream: res,
       useStyles: true,
-      useSharedStrings: true
+      useSharedStrings: false
     };
-    const workbook = new ExcelJS.stream.xlsx.WorkbookWriter(options);
+    const workbook = new ExcelJS.stream.xlsx.WorkbookWriter(workbookOptions);
 
-    const isMultiBESS = bessAssets.length > 1;
+    const reportPeriodStr = formatReportPeriod(from, to, siteTimezone);
 
-    // Calculate the actual header row index to dynamically set the freeze pane (ySplit)
-    // Single-BESS: 6 base metadata rows + 3 single-BESS metadata rows (charge, discharge, blank) + 1 header = 10
-    // Multi-BESS: 6 base metadata rows + (4 rows per BESS asset) + 1 header
-    const headerRowIndex = isMultiBESS ? 6 + (4 * bessAssets.length) + 1 : 10;
+    // Query energy boundaries
+    const boundaryQuery = `
+      SELECT
+        d."bessAssetId",
+        b."name" AS "bessName",
+        (array_agg(th."accumChargeEnergy" ORDER BY th."timestamp" ASC) FILTER (WHERE th."accumChargeEnergy" IS NOT NULL))[1] AS "firstCharge",
+        (array_agg(th."accumChargeEnergy" ORDER BY th."timestamp" DESC) FILTER (WHERE th."accumChargeEnergy" IS NOT NULL))[1] AS "lastCharge",
+        (array_agg(th."accumDischargeEnergy" ORDER BY th."timestamp" ASC) FILTER (WHERE th."accumDischargeEnergy" IS NOT NULL))[1] AS "firstDischarge",
+        (array_agg(th."accumDischargeEnergy" ORDER BY th."timestamp" DESC) FILTER (WHERE th."accumDischargeEnergy" IS NOT NULL))[1] AS "lastDischarge"
+      FROM "TelemetryHistory" th
+      JOIN "Device" d ON th."deviceId" = d."id"
+      JOIN "BESSAsset" b ON d."bessAssetId" = b."id"
+      WHERE ${bessAssetFilter} AND ${timeFilter}
+      GROUP BY d."bessAssetId", b."name"
+      ORDER BY b."name" ASC
+    `;
+    const boundaries = await prisma.$queryRawUnsafe(boundaryQuery) as any[];
+    const boundaryMap: Record<string, any> = {};
+    for (const b of boundaries) {
+      if (b.bessAssetId) boundaryMap[b.bessAssetId] = b;
+      if (b.bessName) boundaryMap[b.bessName] = b;
+    }
 
-    // ----- SETUP WORKSHEETS -----
-    const perBessSheetName = isMultiBESS ? 'Per-BESS Details' : 'Telemetry Report';
-    const sheet1 = workbook.addWorksheet(perBessSheetName, {
-      views: [{ state: 'frozen', xSplit: isMultiBESS ? 2 : 1, ySplit: headerRowIndex }]
-    });
-
-    // Add common metadata header
-    const r1 = sheet1.addRow([isMultiBESS ? 'EMS Reports Export (Multi-BESS)' : 'EMS Reports Export']);
-    r1.font = { bold: true };
-    const r2 = sheet1.addRow(['Client Name:', site.client?.name || 'Unknown Client']);
-    const r3 = sheet1.addRow(['Site Name:', site.name]);
-    const r4 = sheet1.addRow(['Site Identifier:', site.businessIdentifier || 'N/A']);
-    const r5 = sheet1.addRow(['Export Interval:', intervalStr]);
-    sheet1.addRow([]); // Blank row 6
-    [r2, r3, r4, r5].forEach(row => {
-      row.getCell(1).font = { bold: true };
-      row.commit();
-    });
-    r1.commit();
-
-    const sheet1Columns: Partial<ExcelJS.Column>[] = [
-      { header: 'Timestamp', key: 'timestamp', width: 22 },
-      { header: 'BESS Name', key: 'bessName', width: 20 },
-      { header: 'EMU Serial No.', key: 'emuId', width: 20 }
-    ];
-
-    sheet1Columns.push(
-      { header: 'Grid Side Load (kW)', key: 'gridSideLoad', width: 20 },
-      { header: 'Grid Frequency (Hz)', key: 'gridFrequency', width: 22 },
-      { header: 'Grid Power Factor', key: 'powerFactor', width: 18 },
-      { header: 'Cabinet Meter Power (kW)', key: 'totalPower', width: 25 },
-      { header: 'Cabinet Voltage A (V)', key: 'voltageA', width: 22 },
-      { header: 'Cabinet Voltage B (V)', key: 'voltageB', width: 22 },
-      { header: 'Cabinet Voltage C (V)', key: 'voltageC', width: 22 },
-      { header: 'Cabinet Current A (A)', key: 'currentA', width: 22 },
-      { header: 'Cabinet Current B (A)', key: 'currentB', width: 22 },
-      { header: 'Cabinet Current C (A)', key: 'currentC', width: 22 },
-      // Export source: TelemetryHistory.bessFrequency ← pcs.ai_freq
-      { header: 'BESS Frequency (Hz)', key: 'bessFrequency', width: 22 },
-      { header: 'BESS Power Factor', key: 'bessPowerFactor', width: 22 },
-      { header: 'PCS Active Power (kW)', key: 'pcsActivePower', width: 22 },
-      { header: 'DC Voltage (V)', key: 'dcVoltage', width: 18 },
-      { header: 'PCS Temperature (°C)', key: 'ambientTemp', width: 22 },
-      { header: 'SOC (%)', key: 'soc', width: 12 },
-      { header: 'SOH (%)', key: 'soh', width: 12 },
-      { header: 'BMS Current (A)', key: 'bmsCurrent', width: 18 },
-      { header: 'Cell V Max (V)', key: 'cellVMax', width: 18 },
-      { header: 'Cell V Min (V)', key: 'cellVMin', width: 18 },
-      { header: 'Cell Temp Max (°C)', key: 'cellTempMax', width: 22 },
-      { header: 'Today Charge Energy (kWh)', key: 'todayChargeEnergy', width: 25 },
-      { header: 'Today Discharge Energy (kWh)', key: 'todayDischargeEnergy', width: 25 },
-      { header: 'Accum Charge Energy (kWh)', key: 'accumChargeEnergy', width: 25 },
-      { header: 'Accum Discharge Energy (kWh)', key: 'accumDischargeEnergy', width: 25 },
-      { header: 'Solar Power (kW)', key: 'solarPower', width: 18 }
-    );
-    let singleBessRows: any[] | null = null;
+    const round2 = (n: number | null): number | null => (n != null ? Math.round(n * 100) / 100 : null);
     let siteChargeDiff: number | null = null;
     let siteDischargeDiff: number | null = null;
 
-    if (!isMultiBESS) {
-      singleBessRows = await prisma.$queryRawUnsafe(dataQuery) as any[];
+    const perBessDiffMap = new Map<string, { chargeDiff: number | null; dischargeDiff: number | null }>();
+    for (const bess of bessAssets) {
+      const b = boundaryMap[bess.id] || boundaryMap[bess.name];
+      const cDiff = (b && b.firstCharge != null && b.lastCharge != null)
+        ? round2(Number(b.lastCharge) - Number(b.firstCharge))
+        : null;
+      const dDiff = (b && b.firstDischarge != null && b.lastDischarge != null)
+        ? round2(Number(b.lastDischarge) - Number(b.firstDischarge))
+        : null;
 
-      let firstCharge: number | null = null;
-      let lastCharge: number | null = null;
-      let firstDischarge: number | null = null;
-      let lastDischarge: number | null = null;
+      if (cDiff !== null) siteChargeDiff = round2((siteChargeDiff ?? 0) + cDiff);
+      if (dDiff !== null) siteDischargeDiff = round2((siteDischargeDiff ?? 0) + dDiff);
 
-      for (let i = 0; i < singleBessRows.length; i++) {
-        if (lastCharge === null && singleBessRows[i].accumChargeEnergy != null) lastCharge = singleBessRows[i].accumChargeEnergy;
-        if (lastDischarge === null && singleBessRows[i].accumDischargeEnergy != null) lastDischarge = singleBessRows[i].accumDischargeEnergy;
-        if (lastCharge !== null && lastDischarge !== null) break;
-      }
+      perBessDiffMap.set(bess.id, { chargeDiff: cDiff, dischargeDiff: dDiff });
+    }
 
-      for (let i = singleBessRows.length - 1; i >= 0; i--) {
-        if (firstCharge === null && singleBessRows[i].accumChargeEnergy != null) firstCharge = singleBessRows[i].accumChargeEnergy;
-        if (firstDischarge === null && singleBessRows[i].accumDischargeEnergy != null) firstDischarge = singleBessRows[i].accumDischargeEnergy;
-        if (firstCharge !== null && firstDischarge !== null) break;
-      }
+    // Worksheet 1: Site Summary
+    const sheetSummary = workbook.addWorksheet('Site Summary', {
+      views: [{ state: 'frozen', xSplit: 1, ySplit: 11 }]
+    });
 
-      const chargeDiff = (firstCharge != null && lastCharge != null) ? lastCharge - firstCharge : null;
-      const dischargeDiff = (firstDischarge != null && lastDischarge != null) ? lastDischarge - firstDischarge : null;
+    const sr1_meta = sheetSummary.addRow(['EMS Site Summary']);
+    sr1_meta.font = { bold: true };
+    const sr2_meta = sheetSummary.addRow(['Client Name:', site.client?.name || 'Unknown Client']);
+    const sr3_meta = sheetSummary.addRow(['Site Name:', site.name]);
+    const sr4_meta = sheetSummary.addRow(['Site Identifier:', site.businessIdentifier || 'N/A']);
+    const sr5_meta = sheetSummary.addRow(['Report Period:', reportPeriodStr]);
+    const sr6_meta = sheetSummary.addRow(['Export Interval:', intervalStr]);
+    sheetSummary.addRow([]); // Blank row 7
+    [sr2_meta, sr3_meta, sr4_meta, sr5_meta, sr6_meta].forEach(row => {
+      row.getCell(1).font = { bold: true };
+      row.commit();
+    });
+    sr1_meta.commit();
 
-      const r1 = sheet1.addRow(['Total Charge Difference', chargeDiff]);
-      const r2 = sheet1.addRow(['Total Discharge Difference', dischargeDiff]);
-      if (chargeDiff != null) r1.getCell(2).numFmt = '0.00 "kWh"';
-      if (dischargeDiff != null) r2.getCell(2).numFmt = '0.00 "kWh"';
-      r2.commit();
-      sheet1.addRow([]).commit();
-    } else {
-      const boundaryQuery = `
-        SELECT 
-          d."bessAssetId",
-          b."name" AS "bessName",
-          (array_agg(th."accumChargeEnergy" ORDER BY th."timestamp" ASC) FILTER (WHERE th."accumChargeEnergy" IS NOT NULL))[1] AS "firstCharge",
-          (array_agg(th."accumChargeEnergy" ORDER BY th."timestamp" DESC) FILTER (WHERE th."accumChargeEnergy" IS NOT NULL))[1] AS "lastCharge",
-          (array_agg(th."accumDischargeEnergy" ORDER BY th."timestamp" ASC) FILTER (WHERE th."accumDischargeEnergy" IS NOT NULL))[1] AS "firstDischarge",
-          (array_agg(th."accumDischargeEnergy" ORDER BY th."timestamp" DESC) FILTER (WHERE th."accumDischargeEnergy" IS NOT NULL))[1] AS "lastDischarge"
-        FROM "TelemetryHistory" th
-        JOIN "Device" d ON th."deviceId" = d."id"
-        JOIN "BESSAsset" b ON d."bessAssetId" = b."id"
-        WHERE ${bessAssetFilter} AND ${timeFilter}
-        GROUP BY d."bessAssetId", b."name"
-        ORDER BY b."name" ASC
-      `;
-      const boundaries = await prisma.$queryRawUnsafe(boundaryQuery) as any[];
+    const s2Cols: Partial<ExcelJS.Column>[] = [
+      { key: 'timestamp', width: 22 },
+      { key: 'gridPower', width: 22 },
+      { key: 'bessPower', width: 22 },
+      { key: 'solarPower', width: 22 },
+      { key: 'todayCharge', width: 25 },
+      { key: 'todayDischarge', width: 25 },
+      { key: 'soc', width: 18 },
+      { key: 'soh', width: 18 },
+      { key: 'avgGridFreq', width: 25 },
+      { key: 'avgBessFreq', width: 25 },
+      { key: 'avgSolarFreq', width: 25 }
+    ];
 
-      for (const b of boundaries) {
-        const cDiff = (b.firstCharge != null && b.lastCharge != null) ? b.lastCharge - b.firstCharge : null;
-        const dDiff = (b.firstDischarge != null && b.lastDischarge != null) ? b.lastDischarge - b.firstDischarge : null;
+    sheetSummary.columns = s2Cols;
 
-        if (cDiff !== null) siteChargeDiff = (siteChargeDiff ?? 0) + cDiff;
-        if (dDiff !== null) siteDischargeDiff = (siteDischargeDiff ?? 0) + dDiff;
+    const siteChargeDiffDisplay = siteChargeDiff != null ? round2(convertEnergy(siteChargeDiff)) : null;
+    const siteDischargeDiffDisplay = siteDischargeDiff != null ? round2(convertEnergy(siteDischargeDiff)) : null;
 
-        const nameRow = sheet1.addRow([b.bessName]);
-        nameRow.font = { bold: true };
-        nameRow.commit();
-        
-        const r1 = sheet1.addRow(['Total Charge Difference', cDiff]);
-        const r2 = sheet1.addRow(['Total Discharge Difference', dDiff]);
-        if (cDiff != null) r1.getCell(2).numFmt = '0.00 "kWh"';
-        if (dDiff != null) r2.getCell(2).numFmt = '0.00 "kWh"';
-        r1.commit();
-        r2.commit();
-        sheet1.addRow([]).commit();
+    const sr1 = sheetSummary.addRow(['Total Charge Difference', siteChargeDiffDisplay]);
+    const sr2 = sheetSummary.addRow(['Total Discharge Difference', siteDischargeDiffDisplay]);
+    if (siteChargeDiffDisplay != null) sr1.getCell(2).numFmt = `0.00 "${energyUnit}"`;
+    if (siteDischargeDiffDisplay != null) sr2.getCell(2).numFmt = `0.00 "${energyUnit}"`;
+    sr1.commit();
+    sr2.commit();
+    sheetSummary.addRow([]).commit(); // Blank row 10
+
+    // Row 11: Single Authoritative Header Row
+    const row1 = [
+      'Timestamp',
+      `Grid Power (${powerUnit})`,
+      `Total BESS Power (${powerUnit})`,
+      `Solar Power (${powerUnit})`,
+      `Total Today Charge (${energyUnit})`,
+      `Total Today Discharge (${energyUnit})`,
+      'Average SOC (%)',
+      'Average SOH (%)',
+      'Average Grid Frequency (Hz)',
+      'Average BESS Frequency (Hz)',
+      'Average Solar Frequency (Hz)'
+    ];
+
+    const r1_s2 = sheetSummary.addRow(row1); // Row 11
+    r1_s2.font = { bold: true };
+    r1_s2.commit();
+
+    sheetSummary.getColumn('timestamp').numFmt = 'dd mmmm yyyy, hh:mm:ss AM/PM';
+    for (let i = 2; i <= s2Cols.length; i++) {
+      const col = sheetSummary.getColumn(i);
+      if (col.key && col.key.includes('Freq')) {
+        col.numFmt = '0.00';
+      } else {
+        col.numFmt = '0.0';
       }
     }
 
-    sheet1.columns = sheet1Columns.map((c) => ({
-      key: c.key,
-      width: c.width,
-    }));
+    // Column configuration for individual BESS worksheets (authoritative 43 columns)
+    const bessDetailsColumns: Partial<ExcelJS.Column>[] = [
+      { header: 'Timestamp', key: 'timestamp', width: 22 },
+      { header: 'BESS Name', key: 'bessName', width: 20 },
+      { header: 'EMU Serial No.', key: 'emuId', width: 20 },
+      { header: `Grid Side Load (${powerUnit})`, key: 'gridSideLoad', width: 20 },
+      { header: 'Grid Frequency (Hz)', key: 'gridFrequency', width: 22 },
+      { header: 'Grid Power Factor', key: 'powerFactor', width: 18 },
+      { header: 'BESS Frequency (Hz)', key: 'bessFrequency', width: 22 },
+      { header: 'BESS Power Factor', key: 'bessPowerFactor', width: 22 },
+      { header: `PCS Active Power (${powerUnit})`, key: 'pcsActivePower', width: 22 },
+      { header: 'PCS Temperature (°C)', key: 'pcsTemperature', width: 22 },
+      { header: 'Line Voltage (V)', key: 'pcsLineVoltage', width: 18 },
+      { header: 'AC Current (A)', key: 'pcsAcCurrent', width: 18 },
+      { header: 'Operating Mode', key: 'tmsOperatingMode', width: 20 },
+      { header: 'Ambient Temperature (°C)', key: 'tmsAmbientTemp', width: 25 },
+      { header: 'Battery Coolant Return Temperature (°C)', key: 'tmsCoolantReturnTemp', width: 35 },
+      { header: 'Battery Coolant Inlet Temperature (°C)', key: 'tmsCoolantInletTemp', width: 35 },
+      { header: 'Coolant Return Pressure (bar)', key: 'tmsCoolantReturnPressure', width: 28 },
+      { header: 'Coolant Inlet Pressure (bar)', key: 'tmsCoolantInletPressure', width: 28 },
+      { header: 'SOC (%)', key: 'soc', width: 12 },
+      { header: 'SOH (%)', key: 'soh', width: 12 },
+      { header: 'BMS Current (A)', key: 'bmsCurrent', width: 18 },
+      { header: 'BMS DC Voltage (V)', key: 'bmsDcVoltage', width: 20 },
+      { header: 'Cabinet State', key: 'bmsCabinetState', width: 18 },
+      { header: 'Cell V Max (V)', key: 'cellVMax', width: 18 },
+      { header: 'Cell V Min (V)', key: 'cellVMin', width: 18 },
+      { header: 'Cell Temp Max (°C)', key: 'cellTempMax', width: 22 },
+      { header: 'Cell Temp Min (°C)', key: 'cellTempMin', width: 22 },
+      { header: 'Battery Ambient Temperature (°C)', key: 'batteryAmbientTemp', width: 32 },
+      { header: 'Pack 01 Average Temperature (°C)', key: 'pack01AvgTemp', width: 30 },
+      { header: 'Pack 01 Maximum Temperature (°C)', key: 'pack01MaxTemp', width: 30 },
+      { header: 'Pack 02 Average Temperature (°C)', key: 'pack02AvgTemp', width: 30 },
+      { header: 'Pack 02 Maximum Temperature (°C)', key: 'pack02MaxTemp', width: 30 },
+      { header: 'Pack 03 Average Temperature (°C)', key: 'pack03AvgTemp', width: 30 },
+      { header: 'Pack 03 Maximum Temperature (°C)', key: 'pack03MaxTemp', width: 30 },
+      { header: 'Pack 04 Average Temperature (°C)', key: 'pack04AvgTemp', width: 30 },
+      { header: 'Pack 04 Maximum Temperature (°C)', key: 'pack04MaxTemp', width: 30 },
+      { header: 'Pack 05 Average Temperature (°C)', key: 'pack05AvgTemp', width: 30 },
+      { header: 'Pack 05 Maximum Temperature (°C)', key: 'pack05MaxTemp', width: 30 },
+      { header: `Today Charge Energy (${energyUnit})`, key: 'todayChargeEnergy', width: 25 },
+      { header: `Today Discharge Energy (${energyUnit})`, key: 'todayDischargeEnergy', width: 25 },
+      { header: `Accum Charge Energy (${energyUnit})`, key: 'accumChargeEnergy', width: 25 },
+      { header: `Accum Discharge Energy (${energyUnit})`, key: 'accumDischargeEnergy', width: 25 },
+      { header: `Solar Power (${powerUnit})`, key: 'solarPower', width: 18 }
+    ];
 
-    // Explicitly write and commit the table header row
-    const headerRow = sheet1.addRow(sheet1Columns.map((c) => c.header));
-    headerRow.font = { bold: true };
-    headerRow.commit();
-    sheet1.getColumn('timestamp').numFmt = 'dd mmmm yyyy, hh:mm:ss AM/PM';
-    ['gridSideLoad', 'totalPower', 'voltageA', 'voltageB', 'voltageC', 'currentA', 'currentB', 'currentC', 'pcsActivePower', 'dcVoltage', 'ambientTemp', 'soc', 'soh', 'bmsCurrent', 'cellVMax', 'cellVMin', 'cellTempMax', 'todayChargeEnergy', 'todayDischargeEnergy', 'accumChargeEnergy', 'accumDischargeEnergy', 'solarPower'].forEach(key => {
-      sheet1.getColumn(key).numFmt = '0.0';
-    });
-    sheet1.getColumn('powerFactor').numFmt = '0.00';
-    sheet1.getColumn('bessPowerFactor').numFmt = '0.00';
-    sheet1.getColumn('gridFrequency').numFmt = '0.00';
-    sheet1.getColumn('bessFrequency').numFmt = '0.00';
+    // Create one dedicated worksheet per BESS asset (unique, Excel-safe names)
+    const bessSheetNameMap = generateBessWorksheetNames(bessAssets, ['Site Summary']);
+    const bessWorksheets = new Map<string, ExcelJS.Worksheet>();
 
-    let sheet2: ExcelJS.Worksheet | null = null;
-    if (isMultiBESS) {
-      sheet2 = workbook.addWorksheet('Site Summary', {
-        views: [{ state: 'frozen', xSplit: 1, ySplit: 11 }]
+    for (const bess of bessAssets) {
+      const sheetName = bessSheetNameMap.get(bess.id)!;
+      const sheet = workbook.addWorksheet(sheetName, {
+        views: [{ state: 'frozen', xSplit: 2, ySplit: 12 }]
       });
 
-      const sr1_meta = sheet2.addRow(['EMS Site Summary']);
-      sr1_meta.font = { bold: true };
-      const sr2_meta = sheet2.addRow(['Client Name:', site.client?.name || 'Unknown Client']);
-      const sr3_meta = sheet2.addRow(['Site Name:', site.name]);
-      const sr4_meta = sheet2.addRow(['Site Identifier:', site.businessIdentifier || 'N/A']);
-      const sr5_meta = sheet2.addRow(['Export Interval:', intervalStr]);
-      sheet2.addRow([]); // Blank row 6
-      [sr2_meta, sr3_meta, sr4_meta, sr5_meta].forEach(row => {
+      // Rows 1-7: Metadata
+      const r1_s1 = sheet.addRow(['EMS Reports Export (Multi-BESS)']);
+      r1_s1.font = { bold: true };
+      const r2_s1 = sheet.addRow(['Client Name:', site.client?.name || 'Unknown Client']);
+      const r3_s1 = sheet.addRow(['Site Name:', site.name]);
+      const r4_s1 = sheet.addRow(['Site Identifier:', site.businessIdentifier || 'N/A']);
+      const r5_s1 = sheet.addRow(['Report Period:', reportPeriodStr]);
+      const r6_s1 = sheet.addRow(['Export Interval:', intervalStr]);
+      sheet.addRow([]); // Blank row 7
+
+      [r2_s1, r3_s1, r4_s1, r5_s1, r6_s1].forEach(row => {
         row.getCell(1).font = { bold: true };
         row.commit();
       });
-      sr1_meta.commit();
+      r1_s1.commit();
 
-      // Construct columns for sheet 2
-      const s2Cols: Partial<ExcelJS.Column>[] = [
-        { key: 'timestamp', width: 22 },
-        { key: 'gridPower', width: 22 },
-        { key: 'bessPower', width: 22 },
-        { key: 'solarPower', width: 22 },
-        { key: 'todayCharge', width: 25 },
-        { key: 'todayDischarge', width: 25 },
-        { key: 'soc', width: 18 },
-        { key: 'soh', width: 18 },
-        { key: 'pcsTemp', width: 25 }
-      ];
+      // Rows 8-11: BESS Name and Energy Differences
+      const nameRow = sheet.addRow([bess.name]);
+      nameRow.font = { bold: true };
+      nameRow.commit();
 
-      for (let i = 0; i < bessAssets.length; i++) {
-        s2Cols.push({ key: `dcVoltage_${i}`, width: 18 });
-      }
-      for (let i = 0; i < bessAssets.length; i++) {
-        s2Cols.push({ key: `phaseAVoltage_${i}`, width: 18 });
-        s2Cols.push({ key: `phaseACurrent_${i}`, width: 18 });
-        s2Cols.push({ key: `phaseBVoltage_${i}`, width: 18 });
-        s2Cols.push({ key: `phaseBCurrent_${i}`, width: 18 });
-        s2Cols.push({ key: `phaseCVoltage_${i}`, width: 18 });
-        s2Cols.push({ key: `phaseCCurrent_${i}`, width: 18 });
-      }
-      for (let i = 0; i < bessAssets.length; i++) {
-        s2Cols.push({ key: `gridFrequency_${i}`, width: 18 });
-      }
+      const bDiff = perBessDiffMap.get(bess.id);
+      const bChargeDisplay = bDiff?.chargeDiff != null ? round2(convertEnergy(bDiff.chargeDiff)) : null;
+      const bDischargeDisplay = bDiff?.dischargeDiff != null ? round2(convertEnergy(bDiff.dischargeDiff)) : null;
 
-      sheet2.columns = s2Cols;
+      const cr1 = sheet.addRow(['Total Charge Difference', bChargeDisplay]);
+      const cr2 = sheet.addRow(['Total Discharge Difference', bDischargeDisplay]);
+      if (bChargeDisplay != null) cr1.getCell(2).numFmt = `0.00 "${energyUnit}"`;
+      if (bDischargeDisplay != null) cr2.getCell(2).numFmt = `0.00 "${energyUnit}"`;
+      cr1.commit();
+      cr2.commit();
+      sheet.addRow([]).commit(); // Blank row 11
 
-      const sr1 = sheet2.addRow(['Total Charge Difference', siteChargeDiff]);
-      const sr2 = sheet2.addRow(['Total Discharge Difference', siteDischargeDiff]);
-      if (siteChargeDiff != null) sr1.getCell(2).numFmt = '0.00 "kWh"';
-      if (siteDischargeDiff != null) sr2.getCell(2).numFmt = '0.00 "kWh"';
-      sr1.commit();
-      sr2.commit();
-      sheet2.addRow([]).commit();
+      // Row 12: Column headers
+      sheet.columns = bessDetailsColumns.map((c) => ({
+        key: c.key,
+        width: c.width,
+      }));
 
-      // Build Row 4 (Merged headers) and Row 5 (Sub-headers)
-      const row1 = ['Timestamp', 'Total Grid Power (kW)', 'Total BESS Power (kW)', 'Total Solar Power (kW)', 'Total Today Charge (kWh)', 'Total Today Discharge (kWh)', 'Average SOC (%)', 'Average SOH (%)', 'Max PCS Temperature (°C)'];
-      const row2 = ['Timestamp', 'Total Grid Power (kW)', 'Total BESS Power (kW)', 'Total Solar Power (kW)', 'Total Today Charge (kWh)', 'Total Today Discharge (kWh)', 'Average SOC (%)', 'Average SOH (%)', 'Max PCS Temperature (°C)'];
+      const headerRow = sheet.addRow(bessDetailsColumns.map((c) => c.header));
+      headerRow.font = { bold: true };
+      headerRow.commit();
 
-      // DC Voltage
-      const dcVoltStart = 10;
-      row1.push('DC Voltage (V)');
-      row2.push(bessAssets[0].name);
-      for (let i = 1; i < bessAssets.length; i++) {
-        row1.push('');
-        row2.push(bessAssets[i].name);
-      }
+      sheet.getColumn('timestamp').numFmt = 'dd mmmm yyyy, hh:mm:ss AM/PM';
+      [
+        'gridSideLoad', 'pcsActivePower',
+        'pcsTemperature', 'pcsLineVoltage', 'pcsAcCurrent',
+        'tmsAmbientTemp', 'tmsCoolantReturnTemp', 'tmsCoolantInletTemp',
+        'soc', 'soh', 'bmsCurrent', 'bmsDcVoltage',
+        'cellTempMax', 'cellTempMin',
+        'batteryAmbientTemp',
+        'pack01AvgTemp', 'pack01MaxTemp',
+        'pack02AvgTemp', 'pack02MaxTemp',
+        'pack03AvgTemp', 'pack03MaxTemp',
+        'pack04AvgTemp', 'pack04MaxTemp',
+        'pack05AvgTemp', 'pack05MaxTemp',
+        'todayChargeEnergy', 'todayDischargeEnergy',
+        'accumChargeEnergy', 'accumDischargeEnergy', 'solarPower'
+      ].forEach(key => {
+        sheet.getColumn(key).numFmt = '0.0';
+      });
+      sheet.getColumn('powerFactor').numFmt = '0.00';
+      sheet.getColumn('bessPowerFactor').numFmt = '0.00';
+      sheet.getColumn('gridFrequency').numFmt = '0.00';
+      sheet.getColumn('bessFrequency').numFmt = '0.00';
+      sheet.getColumn('tmsCoolantReturnPressure').numFmt = '0.00';
+      sheet.getColumn('tmsCoolantInletPressure').numFmt = '0.00';
+      sheet.getColumn('cellVMax').numFmt = '0.000';
+      sheet.getColumn('cellVMin').numFmt = '0.000';
 
-      // Phase Metrics (Grouped by BESS Name)
-      const phaseMetricsStart = dcVoltStart + bessAssets.length;
-      for (let i = 0; i < bessAssets.length; i++) {
-        row1.push(bessAssets[i].name, '', '', '', '', '');
-        row2.push(
-          'Phase A Voltage (V)', 'Phase A Current (A)',
-          'Phase B Voltage (V)', 'Phase B Current (A)',
-          'Phase C Voltage (V)', 'Phase C Current (A)'
-        );
-      }
-
-      // Grid Frequency
-      const gridFreqStart = phaseMetricsStart + (bessAssets.length * 6);
-      row1.push('Grid Frequency (Hz)');
-      row2.push(bessAssets[0].name);
-      for (let i = 1; i < bessAssets.length; i++) {
-        row1.push('');
-        row2.push(bessAssets[i].name);
-      }
-
-      const r1 = sheet2.addRow(row1); // This will be row 4
-      const r2 = sheet2.addRow(row2); // This will be row 5
-
-      // Merge cells in row 10 (was 4, shifted by 6 metadata rows)
-      if (bessAssets.length > 1) {
-        sheet2.mergeCells(10, dcVoltStart, 10, dcVoltStart + bessAssets.length - 1);
-        sheet2.mergeCells(10, gridFreqStart, 10, gridFreqStart + bessAssets.length - 1);
-      }
-      // Always merge phase metrics per BESS, even if only 1 BESS exists (though this is multi-BESS specific)
-      for (let i = 0; i < bessAssets.length; i++) {
-        const start = phaseMetricsStart + (i * 6);
-        sheet2.mergeCells(10, start, 10, start + 5);
-      }
-
-      r1.font = { bold: true };
-      r1.alignment = { horizontal: 'center' };
-      r2.font = { bold: true };
-
-      r1.commit();
-      r2.commit();
-
-      sheet2.getColumn('timestamp').numFmt = 'dd mmmm yyyy, hh:mm:ss AM/PM';
-      for (let i = 2; i <= s2Cols.length; i++) {
-        const col = sheet2.getColumn(i);
-        if (col.key && col.key.startsWith('gridFrequency_')) {
-          col.numFmt = '0.00';
-        } else {
-          col.numFmt = '0.0';
-        }
-      }
+      bessWorksheets.set(bess.id, sheet);
     }
 
-    // Process data in chunks to prevent huge memory spikes
-    let offset = 0;
-    const limit = 5000;
-    let hasMore = true;
+    const flushSummary = (rows: any[]) => {
+      if (!sheetSummary || rows.length === 0) return;
 
-    // Site summary buffer
+      let sumGrid = 0; let countGrid = 0;
+      let sumBess = 0; let countBess = 0;
+      let sumSolar = 0; let countSolar = 0;
+      let sumCharge = 0; let countCharge = 0;
+      let sumDischarge = 0; let countDischarge = 0;
+      let sumSoc = 0; let countSoc = 0;
+      let sumSoh = 0; let countSoh = 0;
+      let sumGridFreq = 0; let countGridFreq = 0;
+      let sumBessFreq = 0; let countBessFreq = 0;
+      let sumSolarFreq = 0; let countSolarFreq = 0;
+
+      rows.forEach(r => {
+        if (r.gridSideLoad != null) { sumGrid += Number(r.gridSideLoad); countGrid++; }
+        if (r.pcsActivePower != null) { sumBess += Number(r.pcsActivePower); countBess++; }
+        if (r.solarPower != null) { sumSolar += Number(r.solarPower); countSolar++; }
+        if (r.todayChargeEnergy != null) { sumCharge += Number(r.todayChargeEnergy); countCharge++; }
+        if (r.todayDischargeEnergy != null) { sumDischarge += Number(r.todayDischargeEnergy); countDischarge++; }
+        if (r.soc != null) { sumSoc += Number(r.soc); countSoc++; }
+        if (r.soh != null) { sumSoh += Number(r.soh); countSoh++; }
+        if (r.gridFrequency != null) {
+          const f = Number(r.gridFrequency);
+          if (!isNaN(f)) { sumGridFreq += f; countGridFreq++; }
+        }
+        if (r.bessFrequency != null) {
+          const f = Number(r.bessFrequency);
+          if (!isNaN(f)) { sumBessFreq += f; countBessFreq++; }
+        }
+        if (r.solarFrequency != null) {
+          const f = Number(r.solarFrequency);
+          if (!isNaN(f)) { sumSolarFreq += f; countSolarFreq++; }
+        }
+      });
+
+      const s2Row: any = {
+        timestamp: currentBucketTimestamp,
+        gridPower: countGrid > 0 ? round2(convertPower(sumGrid)) : null,
+        bessPower: countBess > 0 ? round2(convertPower(sumBess)) : null,
+        solarPower: countSolar > 0 ? round2(convertPower(sumSolar)) : null,
+        todayCharge: countCharge > 0 ? round2(convertEnergy(sumCharge)) : null,
+        todayDischarge: countDischarge > 0 ? round2(convertEnergy(sumDischarge)) : null,
+        soc: countSoc > 0 ? round2(sumSoc / countSoc) : null,
+        soh: countSoh > 0 ? round2(sumSoh / countSoh) : null,
+        avgGridFreq: countGridFreq > 0 ? round2(sumGridFreq / countGridFreq) : null,
+        avgBessFreq: countBessFreq > 0 ? round2(sumBessFreq / countBessFreq) : null,
+        avgSolarFreq: countSolarFreq > 0 ? round2(sumSolarFreq / countSolarFreq) : null,
+      };
+
+      sheetSummary.addRow(s2Row).commit();
+    };
+
+    const rows = await prisma.$queryRawUnsafe(dataQuery) as any[];
+
+    const dateTimeFormatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: siteTimezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    });
+
     let currentBucketTimestamp: Date | null = null;
     let currentBucketRows: any[] = [];
 
-    const flushSummary = (rows: any[]) => {
-      if (!sheet2 || rows.length === 0) return;
+    for (const row of rows) {
+      processReportBatteryStatusRow(row);
+      processReportPcsRow(row);
+      processReportBmsRow(row);
+      processReportTmsRow(row);
 
+      const bucketTime = row.bucketTimestamp instanceof Date ? row.bucketTimestamp : new Date(row.bucketTimestamp);
+      const parts = dateTimeFormatter.formatToParts(bucketTime);
+      const partMap: Record<string, string> = {};
+      for (const p of parts) partMap[p.type] = p.value;
+
+      const shiftedTime = new Date(Date.UTC(
+        parseInt(partMap.year, 10),
+        parseInt(partMap.month, 10) - 1,
+        parseInt(partMap.day, 10),
+        parseInt(partMap.hour, 10),
+        parseInt(partMap.minute, 10),
+        parseInt(partMap.second, 10)
+      ));
+
+        const s1Row = {
+          timestamp: shiftedTime,
+          bessName: row.bessName,
+          emuId: row.emuId,
+          gridSideLoad: row.gridSideLoad != null ? round2(convertPower(row.gridSideLoad)) : null,
+          gridFrequency: row.gridFrequency != null ? round2(Number(row.gridFrequency)) : null,
+          powerFactor: row.powerFactor != null ? round2(Number(row.powerFactor)) : null,
+          bessFrequency: row.bessFrequency != null ? round2(Number(row.bessFrequency)) : null,
+          bessPowerFactor: row.bessPowerFactor != null ? round2(Number(row.bessPowerFactor)) : null,
+          pcsActivePower: row.pcsActivePower != null ? round2(convertPower(row.pcsActivePower)) : null,
+          pcsTemperature: row.pcsTemperature != null ? round2(Number(row.pcsTemperature)) : null,
+          pcsLineVoltage: row.pcsLineVoltage != null ? round2(Number(row.pcsLineVoltage)) : null,
+          pcsAcCurrent: row.pcsAcCurrent != null ? round2(Number(row.pcsAcCurrent)) : null,
+          tmsOperatingMode: formatTmsMode(row.tmsOperatingMode) || null,
+          tmsAmbientTemp: row.tmsAmbientTemp != null ? round2(Number(row.tmsAmbientTemp)) : null,
+          tmsCoolantReturnTemp: row.tmsCoolantReturnTemp != null ? round2(Number(row.tmsCoolantReturnTemp)) : null,
+          tmsCoolantInletTemp: row.tmsCoolantInletTemp != null ? round2(Number(row.tmsCoolantInletTemp)) : null,
+          tmsCoolantReturnPressure: row.tmsCoolantReturnPressure != null ? round2(Number(row.tmsCoolantReturnPressure)) : null,
+          tmsCoolantInletPressure: row.tmsCoolantInletPressure != null ? round2(Number(row.tmsCoolantInletPressure)) : null,
+          soc: row.soc != null ? round2(Number(row.soc)) : null,
+          soh: row.soh != null ? round2(Number(row.soh)) : null,
+          bmsCurrent: row.bmsCurrent != null ? round2(Number(row.bmsCurrent)) : null,
+          bmsDcVoltage: row.bmsDcVoltage != null ? round2(Number(row.bmsDcVoltage)) : null,
+          bmsCabinetState: formatCabinetState(row.bmsCabinetState) || null,
+          cellVMax: row.cellVMax != null ? Math.round(Number(row.cellVMax) * 1000) / 1000 : null,
+          cellVMin: row.cellVMin != null ? Math.round(Number(row.cellVMin) * 1000) / 1000 : null,
+          cellTempMax: row.cellTempMax != null ? round2(Number(row.cellTempMax)) : null,
+          cellTempMin: row.cellTempMin != null ? round2(Number(row.cellTempMin)) : null,
+          batteryAmbientTemp: row.batteryAmbientTemp != null ? round2(Number(row.batteryAmbientTemp)) : null,
+          pack01AvgTemp: row.pack01AvgTemp != null ? round2(Number(row.pack01AvgTemp)) : null,
+          pack01MaxTemp: row.pack01MaxTemp != null ? round2(Number(row.pack01MaxTemp)) : null,
+          pack02AvgTemp: row.pack02AvgTemp != null ? round2(Number(row.pack02AvgTemp)) : null,
+          pack02MaxTemp: row.pack02MaxTemp != null ? round2(Number(row.pack02MaxTemp)) : null,
+          pack03AvgTemp: row.pack03AvgTemp != null ? round2(Number(row.pack03AvgTemp)) : null,
+          pack03MaxTemp: row.pack03MaxTemp != null ? round2(Number(row.pack03MaxTemp)) : null,
+          pack04AvgTemp: row.pack04AvgTemp != null ? round2(Number(row.pack04AvgTemp)) : null,
+          pack04MaxTemp: row.pack04MaxTemp != null ? round2(Number(row.pack04MaxTemp)) : null,
+          pack05AvgTemp: row.pack05AvgTemp != null ? round2(Number(row.pack05AvgTemp)) : null,
+          pack05MaxTemp: row.pack05MaxTemp != null ? round2(Number(row.pack05MaxTemp)) : null,
+          todayChargeEnergy: row.todayChargeEnergy != null ? round2(convertEnergy(row.todayChargeEnergy)) : null,
+          todayDischargeEnergy: row.todayDischargeEnergy != null ? round2(convertEnergy(row.todayDischargeEnergy)) : null,
+          accumChargeEnergy: row.accumChargeEnergy != null ? round2(convertEnergy(row.accumChargeEnergy)) : null,
+          accumDischargeEnergy: row.accumDischargeEnergy != null ? round2(convertEnergy(row.accumDischargeEnergy)) : null,
+          solarPower: row.solarPower != null ? round2(convertPower(row.solarPower)) : null,
+        };
+
+        const targetSheet = bessWorksheets.get(row.bessAssetId);
+        if (targetSheet) {
+          targetSheet.addRow(s1Row).commit();
+        }
+
+        const rowTimeStr = shiftedTime.getTime();
+        if (currentBucketTimestamp && currentBucketTimestamp.getTime() !== rowTimeStr) {
+          flushSummary(currentBucketRows);
+          currentBucketRows = [];
+        }
+        currentBucketTimestamp = shiftedTime;
+        currentBucketRows.push(row);
+      }
+
+    if (currentBucketRows.length > 0) {
+      flushSummary(currentBucketRows);
+    }
+
+    sheetSummary.commit();
+    for (const sheet of bessWorksheets.values()) {
+      sheet.commit();
+    }
+    await workbook.commit();
+  }
+
+  public async exportMultiBessCsv(
+    res: Response,
+    siteId: string,
+    intervalMinutes: number,
+    from: Date | undefined,
+    to: Date | undefined,
+    preloadedSite?: any,
+    preloadedBessAssets?: any[],
+    options?: ExportUnitOptions
+  ) {
+    const site = preloadedSite || await prisma.site.findUnique({
+      where: { id: siteId },
+      include: { client: true }
+    });
+    if (!site) {
+      throw new Error('Site not found');
+    }
+    const siteTimezone = site.timezone || 'Asia/Kolkata';
+
+    const bessAssets = preloadedBessAssets || await prisma.bESSAsset.findMany({
+      where: { siteId },
+      orderBy: { name: 'asc' },
+    });
+
+    if (bessAssets.length === 0) {
+      throw new Error('No BESS assets found for this site.');
+    }
+
+    const { powerUnit, energyUnit, convertPower, convertEnergy } = getExportUnitConverters(options);
+
+    const effectiveInterval = intervalMinutes || bessAssets[0]?.reportIntervalMinutes || 15;
+    const intervalStr = `${effectiveInterval} minutes`;
+    const { dataQuery, bessAssetFilter, timeFilter } = this.buildDataQuery(siteId, intervalStr, from, to, true);
+
+    if (typeof res.setHeader === 'function' && !res.headersSent) {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    }
+
+    // Send UTF-8 BOM for Microsoft Excel compatibility
+    res.write('\uFEFF');
+
+    // Section 1: Common Metadata Headers
+    const reportPeriodStr = formatReportPeriod(from, to, siteTimezone);
+    res.write(formatCsvRow(['EMS Reports Export (Multi-BESS)']));
+    res.write(formatCsvRow(['Client Name:', site.client?.name || 'Unknown Client']));
+    res.write(formatCsvRow(['Site Name:', site.name]));
+    res.write(formatCsvRow(['Site Identifier:', site.businessIdentifier || 'N/A']));
+    res.write(formatCsvRow(['Report Period:', reportPeriodStr]));
+    res.write(formatCsvRow(['Export Interval:', intervalStr]));
+    res.write(formatCsvRow([])); // Blank line
+
+    const round2 = (n: number | null): number | null => (n != null ? Math.round(n * 100) / 100 : null);
+    const boundaryQuery = `
+      SELECT
+        d."bessAssetId",
+        b."name" AS "bessName",
+        (array_agg(th."accumChargeEnergy" ORDER BY th."timestamp" ASC) FILTER (WHERE th."accumChargeEnergy" IS NOT NULL))[1] AS "firstCharge",
+        (array_agg(th."accumChargeEnergy" ORDER BY th."timestamp" DESC) FILTER (WHERE th."accumChargeEnergy" IS NOT NULL))[1] AS "lastCharge",
+        (array_agg(th."accumDischargeEnergy" ORDER BY th."timestamp" ASC) FILTER (WHERE th."accumDischargeEnergy" IS NOT NULL))[1] AS "firstDischarge",
+        (array_agg(th."accumDischargeEnergy" ORDER BY th."timestamp" DESC) FILTER (WHERE th."accumDischargeEnergy" IS NOT NULL))[1] AS "lastDischarge"
+      FROM "TelemetryHistory" th
+      JOIN "Device" d ON th."deviceId" = d."id"
+      JOIN "BESSAsset" b ON d."bessAssetId" = b."id"
+      WHERE ${bessAssetFilter} AND ${timeFilter}
+      GROUP BY d."bessAssetId", b."name"
+      ORDER BY b."name" ASC
+    `;
+    const boundaries = await prisma.$queryRawUnsafe(boundaryQuery) as any[];
+
+    let siteChargeDiff: number | null = null;
+    let siteDischargeDiff: number | null = null;
+    const boundaryMap: Record<string, any> = {};
+    for (const b of boundaries) {
+      if (b.bessAssetId) boundaryMap[b.bessAssetId] = b;
+      if (b.bessName) boundaryMap[b.bessName] = b;
+    }
+
+    const perBessDiffs: { name: string; chargeDiff: number | null; dischargeDiff: number | null }[] = [];
+    for (const bess of bessAssets) {
+      const b = boundaryMap[bess.id] || boundaryMap[bess.name];
+      const cDiff = (b && b.firstCharge != null && b.lastCharge != null)
+        ? round2(Number(b.lastCharge) - Number(b.firstCharge))
+        : null;
+      const dDiff = (b && b.firstDischarge != null && b.lastDischarge != null)
+        ? round2(Number(b.lastDischarge) - Number(b.firstDischarge))
+        : null;
+
+      if (cDiff !== null) siteChargeDiff = round2((siteChargeDiff ?? 0) + cDiff);
+      if (dDiff !== null) siteDischargeDiff = round2((siteDischargeDiff ?? 0) + dDiff);
+
+      perBessDiffs.push({ name: bess.name, chargeDiff: cDiff, dischargeDiff: dDiff });
+    }
+
+    const siteChargeDiffDisplay = siteChargeDiff != null ? round2(convertEnergy(siteChargeDiff)) : null;
+    const siteDischargeDiffDisplay = siteDischargeDiff != null ? round2(convertEnergy(siteDischargeDiff)) : null;
+
+    // Section 2: Energy Summaries
+    res.write(formatCsvRow(['--- SITE ENERGY SUMMARY ---']));
+    res.write(formatCsvRow([`Total Site Charge Difference (${energyUnit})`, siteChargeDiffDisplay != null ? siteChargeDiffDisplay : '']));
+    res.write(formatCsvRow([`Total Site Discharge Difference (${energyUnit})`, siteDischargeDiffDisplay != null ? siteDischargeDiffDisplay : '']));
+    res.write(formatCsvRow([])); // Blank line
+
+    res.write(formatCsvRow(['--- PER-BESS ENERGY SUMMARY ---']));
+    res.write(formatCsvRow(['BESS Name', `Total Charge Difference (${energyUnit})`, `Total Discharge Difference (${energyUnit})`]));
+    for (const b of perBessDiffs) {
+      const bChargeDisplay = b.chargeDiff != null ? round2(convertEnergy(b.chargeDiff)) : '';
+      const bDischargeDisplay = b.dischargeDiff != null ? round2(convertEnergy(b.dischargeDiff)) : '';
+      res.write(formatCsvRow([b.name, bChargeDisplay, bDischargeDisplay]));
+    }
+    res.write(formatCsvRow([])); // Blank line
+
+    // Section 3: Site Summary Interval Telemetry
+    const siteSummaryHeaders: string[] = [
+      'Timestamp',
+      `Total Grid Power (${powerUnit})`,
+      `Total BESS Power (${powerUnit})`,
+      `Total Solar Power (${powerUnit})`,
+      `Total Today Charge (${energyUnit})`,
+      `Total Today Discharge (${energyUnit})`,
+      'Average SOC (%)',
+      'Average SOH (%)',
+      'Max PCS Temperature (°C)'
+    ];
+
+    // Grid Frequency columns per BESS
+    for (let i = 0; i < bessAssets.length; i++) {
+      siteSummaryHeaders.push(`${bessAssets[i].name} Grid Frequency (Hz)`);
+    }
+
+    res.write(formatCsvRow(['--- SITE SUMMARY (INTERVAL TELEMETRY) ---']));
+    res.write(formatCsvRow(siteSummaryHeaders));
+
+    const multiBessRows = await prisma.$queryRawUnsafe(dataQuery) as any[];
+
+    for (const row of multiBessRows) {
+      processReportBatteryStatusRow(row);
+      processReportPcsRow(row);
+      processReportBmsRow(row);
+      processReportTmsRow(row);
+    }
+
+    // Group rows by bucket timestamp to aggregate Site Summary intervals
+    const bucketMap = new Map<string, any[]>();
+    for (const row of multiBessRows) {
+      const tsKey = row.bucketTimestamp instanceof Date
+        ? row.bucketTimestamp.toISOString()
+        : new Date(row.bucketTimestamp).toISOString();
+      if (!bucketMap.has(tsKey)) {
+        bucketMap.set(tsKey, []);
+      }
+      bucketMap.get(tsKey)!.push(row);
+    }
+
+    // Number formatting helper (up to 2 decimals)
+    const format2Dec = (v: any) => {
+      if (v === null || v === undefined) return '';
+      const num = Number(v);
+      if (isNaN(num)) return v;
+      return Math.round(num * 100) / 100;
+    };
+
+    const format3Dec = (v: any) => {
+      if (v === null || v === undefined) return '';
+      const num = Number(v);
+      if (isNaN(num)) return v;
+      return Math.round(num * 1000) / 1000;
+    };
+
+    for (const [, bucketRows] of bucketMap) {
       let sumGrid = 0; let countGrid = 0;
       let sumBess = 0; let countBess = 0;
       let sumSolar = 0; let countSolar = 0;
@@ -382,165 +1118,124 @@ export class ReportExportService {
       let sumSoh = 0; let countSoh = 0;
       let maxTemp = -Infinity; let countTemp = 0;
 
-      const voltMap: any = {};
+      const voltMap: Record<string, any> = {};
 
-      rows.forEach(r => {
-        if (r.gridSideLoad != null) { sumGrid += r.gridSideLoad; countGrid++; }
-        if (r.pcsActivePower != null) { sumBess += r.pcsActivePower; countBess++; }
-        if (r.solarPower != null) { sumSolar += r.solarPower; countSolar++; }
-        if (r.todayChargeEnergy != null) { sumCharge += r.todayChargeEnergy; countCharge++; }
-        if (r.todayDischargeEnergy != null) { sumDischarge += r.todayDischargeEnergy; countDischarge++; }
-        if (r.soc != null) { sumSoc += r.soc; countSoc++; }
-        if (r.soh != null) { sumSoh += r.soh; countSoh++; }
+      bucketRows.forEach(r => {
+        if (r.gridSideLoad != null) { sumGrid += Number(r.gridSideLoad); countGrid++; }
+        if (r.pcsActivePower != null) { sumBess += Number(r.pcsActivePower); countBess++; }
+        if (r.solarPower != null) { sumSolar += Number(r.solarPower); countSolar++; }
+        if (r.todayChargeEnergy != null) { sumCharge += Number(r.todayChargeEnergy); countCharge++; }
+        if (r.todayDischargeEnergy != null) { sumDischarge += Number(r.todayDischargeEnergy); countDischarge++; }
+        if (r.soc != null) { sumSoc += Number(r.soc); countSoc++; }
+        if (r.soh != null) { sumSoh += Number(r.soh); countSoh++; }
         if (r.ambientTemp != null) {
-          if (r.ambientTemp > maxTemp) maxTemp = r.ambientTemp;
+          const t = Number(r.ambientTemp);
+          if (t > maxTemp) maxTemp = t;
           countTemp++;
         }
-        
-        voltMap[r.bessAssetId] = {
-          dcVoltage: r.dcVoltage,
-          voltageA: r.voltageA,
-          currentA: r.currentA,
-          voltageB: r.voltageB,
-          currentB: r.currentB,
-          voltageC: r.voltageC,
-          currentC: r.currentC,
-          gridFrequency: r.gridFrequency
+
+        const key = r.bessAssetId || r.bessName;
+        voltMap[key] = {
+          gridFrequency: r.gridFrequency != null ? Number(r.gridFrequency) : null
         };
       });
 
-      const s2Row: any = {
-        timestamp: currentBucketTimestamp,
-        gridPower: countGrid > 0 ? sumGrid : null,
-        bessPower: countBess > 0 ? sumBess : null,
-        solarPower: countSolar > 0 ? sumSolar : null,
-        todayCharge: countCharge > 0 ? sumCharge : null,
-        todayDischarge: countDischarge > 0 ? sumDischarge : null,
-        soc: countSoc > 0 ? (sumSoc / countSoc) : null,
-        soh: countSoh > 0 ? (sumSoh / countSoh) : null,
-        pcsTemp: countTemp > 0 ? maxTemp : null,
-      };
+      const bucketTime = bucketRows[0].bucketTimestamp instanceof Date
+        ? bucketRows[0].bucketTimestamp
+        : new Date(bucketRows[0].bucketTimestamp);
+      const formattedBucketTime = formatSiteTimestamp(bucketTime, siteTimezone);
+
+      const s2RowData: any[] = [
+        formattedBucketTime,
+        countGrid > 0 ? format2Dec(convertPower(sumGrid)) : '',
+        countBess > 0 ? format2Dec(convertPower(sumBess)) : '',
+        countSolar > 0 ? format2Dec(convertPower(sumSolar)) : '',
+        countCharge > 0 ? format2Dec(convertEnergy(sumCharge)) : '',
+        countDischarge > 0 ? format2Dec(convertEnergy(sumDischarge)) : '',
+        countSoc > 0 ? format2Dec(sumSoc / countSoc) : '',
+        countSoh > 0 ? format2Dec(sumSoh / countSoh) : '',
+        countTemp > 0 ? format2Dec(maxTemp) : ''
+      ];
 
       for (let i = 0; i < bessAssets.length; i++) {
         const bess = bessAssets[i];
-        const vals = voltMap[bess.id];
-        s2Row[`dcVoltage_${i}`] = vals && vals.dcVoltage != null ? vals.dcVoltage : null;
-        s2Row[`phaseAVoltage_${i}`] = vals && vals.voltageA != null ? vals.voltageA : null;
-        s2Row[`phaseACurrent_${i}`] = vals && vals.currentA != null ? vals.currentA : null;
-        s2Row[`phaseBVoltage_${i}`] = vals && vals.voltageB != null ? vals.voltageB : null;
-        s2Row[`phaseBCurrent_${i}`] = vals && vals.currentB != null ? vals.currentB : null;
-        s2Row[`phaseCVoltage_${i}`] = vals && vals.voltageC != null ? vals.voltageC : null;
-        s2Row[`phaseCCurrent_${i}`] = vals && vals.currentC != null ? vals.currentC : null;
-        s2Row[`gridFrequency_${i}`] = vals && vals.gridFrequency != null ? vals.gridFrequency : null;
+        const vals = voltMap[bess.id] || voltMap[bess.name];
+        s2RowData.push(vals && vals.gridFrequency != null ? format2Dec(vals.gridFrequency) : '');
       }
 
-      sheet2.addRow(s2Row).commit();
-    };
+      res.write(formatCsvRow(s2RowData));
+    }
+    res.write(formatCsvRow([])); // Blank line
 
-    while (hasMore) {
-      let chunk: any[];
-      if (singleBessRows) {
-        chunk = singleBessRows.slice(offset, offset + limit);
-      } else {
-        const pagedQuery = `${dataQuery} LIMIT ${limit} OFFSET ${offset}`;
-        chunk = await prisma.$queryRawUnsafe(pagedQuery);
-      }
+    // Section 4: Per-BESS Details Interval Telemetry
+    res.write(formatCsvRow(['--- PER-BESS DETAILS (INTERVAL TELEMETRY) ---']));
+    const headers = getAuthoritativeTelemetryHeaders({ powerUnit, energyUnit });
+    res.write(formatCsvRow(headers));
 
-      for (const row of chunk) {
-        const bucketTime = new Date(row.bucketTimestamp);
-        // Format the UTC date to the site's local time components
-        const formatter = new Intl.DateTimeFormat('en-US', {
-          timeZone: siteTimezone,
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-          hourCycle: 'h23',
-        });
+    for (const row of multiBessRows) {
+      const bucketTime = row.bucketTimestamp instanceof Date ? row.bucketTimestamp : new Date(row.bucketTimestamp);
+      const formattedTime = formatSiteTimestamp(bucketTime, siteTimezone);
 
-        const parts = formatter.formatToParts(bucketTime);
-        const partMap: Record<string, string> = {};
-        for (const p of parts) partMap[p.type] = p.value;
-
-        // Create a JS Date that reflects these local components in the server's local environment.
-        // ExcelJS will read its .getFullYear(), .getHours(), etc. and write exactly those to the XLSX cell.
-        const shiftedTime = new Date(Date.UTC(
-          parseInt(partMap.year, 10),
-          parseInt(partMap.month, 10) - 1,
-          parseInt(partMap.day, 10),
-          parseInt(partMap.hour, 10),
-          parseInt(partMap.minute, 10),
-          parseInt(partMap.second, 10)
-        ));
-
-        const s1Row = {
-          timestamp: shiftedTime,
-          bessName: row.bessName,
-          emuId: row.emuId,
-          gridSideLoad: row.gridSideLoad != null ? row.gridSideLoad : null,
-          gridFrequency: row.gridFrequency != null ? row.gridFrequency : null,
-          powerFactor: row.powerFactor != null ? row.powerFactor : null,
-          totalPower: row.totalPower != null ? row.totalPower : null,
-          voltageA: row.voltageA != null ? row.voltageA : null,
-          voltageB: row.voltageB != null ? row.voltageB : null,
-          voltageC: row.voltageC != null ? row.voltageC : null,
-          currentA: row.currentA != null ? row.currentA : null,
-          currentB: row.currentB != null ? row.currentB : null,
-          currentC: row.currentC != null ? row.currentC : null,
-          bessFrequency: row.bessFrequency != null ? row.bessFrequency : null,
-          bessPowerFactor: row.bessPowerFactor != null ? row.bessPowerFactor : null,
-          pcsActivePower: row.pcsActivePower != null ? row.pcsActivePower : null,
-          dcVoltage: row.dcVoltage != null ? row.dcVoltage : null,
-          ambientTemp: row.ambientTemp != null ? row.ambientTemp : null,
-          soc: row.soc != null ? row.soc : null,
-          soh: row.soh != null ? row.soh : null,
-          bmsCurrent: row.bmsCurrent != null ? row.bmsCurrent : null,
-          cellVMax: row.cellVMax != null ? row.cellVMax : null,
-          cellVMin: row.cellVMin != null ? row.cellVMin : null,
-          cellTempMax: row.cellTempMax != null ? row.cellTempMax : null,
-          todayChargeEnergy: row.todayChargeEnergy != null ? row.todayChargeEnergy : null,
-          todayDischargeEnergy: row.todayDischargeEnergy != null ? row.todayDischargeEnergy : null,
-          accumChargeEnergy: row.accumChargeEnergy != null ? row.accumChargeEnergy : null,
-          accumDischargeEnergy: row.accumDischargeEnergy != null ? row.accumDischargeEnergy : null,
-          solarPower: row.solarPower != null ? row.solarPower : null,
-        };
-
-        sheet1.addRow(s1Row).commit();
-
-        if (isMultiBESS) {
-          const rowTimeStr = shiftedTime.getTime();
-          if (currentBucketTimestamp && currentBucketTimestamp.getTime() !== rowTimeStr) {
-            flushSummary(currentBucketRows);
-            currentBucketRows = [];
-          }
-          currentBucketTimestamp = shiftedTime;
-          currentBucketRows.push(row);
-        }
-      }
-
-      if (chunk.length < limit) {
-        hasMore = false;
-      } else {
-        offset += limit;
-      }
+      const dataRow = [
+        formattedTime,
+        row.bessName,
+        row.emuId,
+        format2Dec(convertPower(row.gridSideLoad)),
+        format2Dec(row.gridFrequency),
+        format2Dec(row.powerFactor),
+        format2Dec(row.bessFrequency),
+        format2Dec(row.bessPowerFactor),
+        format2Dec(convertPower(row.pcsActivePower)),
+        format2Dec(row.pcsTemperature),
+        format2Dec(row.pcsLineVoltage),
+        format2Dec(row.pcsAcCurrent),
+        formatTmsMode(row.tmsOperatingMode),
+        format2Dec(row.tmsAmbientTemp),
+        format2Dec(row.tmsCoolantReturnTemp),
+        format2Dec(row.tmsCoolantInletTemp),
+        format2Dec(row.tmsCoolantReturnPressure),
+        format2Dec(row.tmsCoolantInletPressure),
+        format2Dec(row.soc),
+        format2Dec(row.soh),
+        format2Dec(row.bmsCurrent),
+        format2Dec(row.bmsDcVoltage),
+        formatCabinetState(row.bmsCabinetState),
+        format3Dec(row.cellVMax),
+        format3Dec(row.cellVMin),
+        format2Dec(row.cellTempMax),
+        format2Dec(row.cellTempMin),
+        format2Dec(row.batteryAmbientTemp),
+        format2Dec(row.pack01AvgTemp),
+        format2Dec(row.pack01MaxTemp),
+        format2Dec(row.pack02AvgTemp),
+        format2Dec(row.pack02MaxTemp),
+        format2Dec(row.pack03AvgTemp),
+        format2Dec(row.pack03MaxTemp),
+        format2Dec(row.pack04AvgTemp),
+        format2Dec(row.pack04MaxTemp),
+        format2Dec(row.pack05AvgTemp),
+        format2Dec(row.pack05MaxTemp),
+        format2Dec(convertEnergy(row.todayChargeEnergy)),
+        format2Dec(convertEnergy(row.todayDischargeEnergy)),
+        format2Dec(convertEnergy(row.accumChargeEnergy)),
+        format2Dec(convertEnergy(row.accumDischargeEnergy)),
+        format2Dec(convertPower(row.solarPower))
+      ];
+      res.write(formatCsvRow(dataRow));
     }
 
-    if (isMultiBESS && currentBucketRows.length > 0) {
-      flushSummary(currentBucketRows);
-    }
-
-    sheet1.commit();
-    if (sheet2) sheet2.commit();
-    await workbook.commit();
+    res.end();
   }
+
+  // Alias for backward compatibility with existing callers/tests
+  public generateExcelExport = this.exportDynamicReport;
 
   public async exportVoltageTrend(
     res: Response,
     bessAssetId: string,
     from: Date | undefined,
-    to: Date | undefined
+    to: Date | undefined,
+    includeUnknown: boolean = false
   ) {
     const bessAsset = await prisma.bESSAsset.findUnique({
       where: { id: bessAssetId },
@@ -574,52 +1269,64 @@ export class ReportExportService {
       JOIN "Device" d ON th."deviceId" = d."id"
       JOIN "BESSAsset" b ON d."bessAssetId" = b."id"
       WHERE d."bessAssetId" = '${bessAssetId}' AND d."componentId" = 'pcs' AND ${timeFilter}
-      ORDER BY th."timestamp" ASC
+      ORDER BY th."timestamp" ASC, th."gridOnState" DESC NULLS LAST
     `;
 
-    const options = { stream: res, useStyles: true, useSharedStrings: true };
-    const workbook = new ExcelJS.stream.xlsx.WorkbookWriter(options);
-    const sheet1 = workbook.addWorksheet('Voltage Trend', { views: [{ state: 'frozen', xSplit: 0, ySplit: 11 }] });
+    // Metadata Rows (Rows 1-11)
+    res.write(formatCsvRow(['Voltage Trend Report']));
+    res.write(formatCsvRow(['Client Name:', bessAsset.site?.client?.name || 'Unknown Client']));
+    res.write(formatCsvRow(['Site Name:', bessAsset.site?.name || 'Unknown Site']));
+    res.write(formatCsvRow(['Site Identifier:', bessAsset.site?.businessIdentifier || 'N/A']));
+    res.write(formatCsvRow(['BESS Asset:', bessAsset.name]));
+    res.write(formatCsvRow(['BESS Identifier:', bessAsset.assetIdentifier || 'N/A']));
+    res.write(formatCsvRow(['EMU Serial No.:', bessAsset.emuId || 'N/A']));
+    res.write(formatCsvRow(['BESS Model:', bessAsset.model || 'N/A']));
+    res.write(formatCsvRow(['Energy Capacity:', bessAsset.energyCapacity != null ? bessAsset.energyCapacity + ' kWh' : 'N/A']));
+    res.write(formatCsvRow(['Power Rating:', bessAsset.powerRating != null ? bessAsset.powerRating + ' kW' : 'N/A']));
+    res.write(formatCsvRow(['Note:', includeUnknown ? 'Active Source "UNKNOWN" indicates operating state is missing; raw measurements are displayed but source activity is unconfirmed.' : 'Only records with confirmed operating states are included in this report.']));
 
-    const r1 = sheet1.addRow(['Voltage Trend Report']);
-    r1.font = { bold: true };
-    const r2 = sheet1.addRow(['Client Name:', bessAsset.site?.client?.name || 'Unknown Client']);
-    const r3 = sheet1.addRow(['Site Name:', bessAsset.site?.name || 'Unknown Site']);
-    const r4 = sheet1.addRow(['Site Identifier:', bessAsset.site?.businessIdentifier || 'N/A']);
-    const r5 = sheet1.addRow(['BESS Asset:', bessAsset.name]);
-    const r6 = sheet1.addRow(['BESS Identifier:', bessAsset.assetIdentifier || 'N/A']);
-    const r7 = sheet1.addRow(['EMU Serial No.:', bessAsset.emuId || 'N/A']);
-    const r8 = sheet1.addRow(['BESS Model:', bessAsset.model || 'N/A']);
-    const r9 = sheet1.addRow(['Energy Capacity:', bessAsset.energyCapacity != null ? bessAsset.energyCapacity + ' kWh' : 'N/A']);
-    const r10 = sheet1.addRow(['Power Rating:', bessAsset.powerRating != null ? bessAsset.powerRating + ' kW' : 'N/A']);
-    sheet1.addRow([]); // Blank row 11
-    
-    [r2, r3, r4, r5, r6, r7, r8, r9, r10].forEach(row => {
-      row.getCell(1).font = { bold: true };
-      row.commit();
-    });
-    r1.commit();
-
-    const sheet1Columns: Partial<ExcelJS.Column>[] = [
-      { header: 'Time', key: 'timestamp', width: 22 },
-      { header: 'BESS Asset', key: 'bessAsset', width: 20 },
-      { header: 'EMU Serial No.', key: 'emuId', width: 20 },
-      { header: 'Grid Uab (V)', key: 'gridUab', width: 18 },
-      { header: 'Grid Ubc (V)', key: 'gridUbc', width: 18 },
-      { header: 'Grid Uca (V)', key: 'gridUca', width: 18 },
-      { header: 'BESS Ua (V)', key: 'bessUa', width: 18 },
-      { header: 'BESS Ub (V)', key: 'bessUb', width: 18 },
-      { header: 'BESS Uc (V)', key: 'bessUc', width: 18 },
+    // Column Headers (Row 12)
+    const headers = [
+      'Timestamp',
+      'BESS Asset',
+      'EMU Serial No.',
+      'Active Source',
+      'Grid Uab (V)',
+      'Grid Ubc (V)',
+      'Grid Uca (V)',
+      'BESS Uab (V)',
+      'BESS Ubc (V)',
+      'BESS Uca (V)',
     ];
-    sheet1.columns = sheet1Columns.map((c) => ({ key: c.key, width: c.width }));
-    const headerRow = sheet1.addRow(sheet1Columns.map((c) => c.header));
-    headerRow.font = { bold: true };
-    headerRow.commit();
-    sheet1.getColumn('timestamp').numFmt = 'dd mmmm yyyy, hh:mm:ss.000 AM/PM';
+    res.write(formatCsvRow(headers));
 
     let offset = 0;
     const limit = 5000;
     let hasMore = true;
+    const processor = new VoltageTrendProcessor();
+
+    if (from) {
+      const lastKnownStateQuery = `
+        SELECT th."timestamp", th."gridOnState", th."gridOffState"
+        FROM "TelemetryHistory" th
+        JOIN "Device" d ON th."deviceId" = d."id"
+        WHERE d."bessAssetId" = '${bessAssetId}'
+          AND d."componentId" = 'pcs'
+          AND th."timestamp" < '${from.toISOString()}'::timestamp
+          AND (th."gridOnState" IS NOT NULL OR th."gridOffState" IS NOT NULL)
+        ORDER BY th."timestamp" DESC
+        LIMIT 1
+      `;
+      const lastKnownStateRows = await prisma.$queryRawUnsafe(lastKnownStateQuery) as any[];
+      if (lastKnownStateRows.length > 0) {
+        const row = lastKnownStateRows[0];
+        processor.setInitialState(
+          row.gridOnState,
+          row.gridOffState,
+          row.timestamp instanceof Date ? row.timestamp.getTime() : new Date(row.timestamp).getTime()
+        );
+      }
+    }
 
     while (hasMore) {
       const chunkQuery = `${dataQuery} LIMIT ${limit} OFFSET ${offset}`;
@@ -627,63 +1334,27 @@ export class ReportExportService {
 
       for (const row of chunk) {
         const bucketTime = row.timestamp as Date;
-        const ms = bucketTime.getUTCMilliseconds();
-        const formatter = new Intl.DateTimeFormat('en-US', {
-          timeZone: siteTimezone,
-          year: 'numeric',
-          month: 'numeric',
-          day: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-          hourCycle: 'h23',
-        });
+        const formattedTime = formatSiteTimestamp(bucketTime, siteTimezone);
 
-        const parts = formatter.formatToParts(bucketTime);
-        const partMap: Record<string, string> = {};
-        for (const p of parts) partMap[p.type] = p.value;
+        const { activeSource, gridUab, gridUbc, gridUca, bessUa, bessUb, bessUc } = processor.processRow(row);
 
-        const shiftedTime = new Date(Date.UTC(
-          parseInt(partMap.year, 10),
-          parseInt(partMap.month, 10) - 1,
-          parseInt(partMap.day, 10),
-          parseInt(partMap.hour, 10),
-          parseInt(partMap.minute, 10),
-          parseInt(partMap.second, 10),
-          ms
-        ));
-
-        const isGridActive = row.gridOnState === 1;
-        const isBessActive = row.gridOnState === 0 && row.gridOffState === 1;
-
-        let exportGridUab = row.gridVoltageUab;
-        let exportGridUbc = row.gridVoltageUbc;
-        let exportGridUca = row.gridVoltageUca;
-        let exportBessUa = row.bessVoltageUa;
-        let exportBessUb = row.bessVoltageUb;
-        let exportBessUc = row.bessVoltageUc;
-
-        if (isGridActive) {
-          exportBessUa = 0;
-          exportBessUb = 0;
-          exportBessUc = 0;
-        } else if (isBessActive) {
-          exportGridUab = 0;
-          exportGridUbc = 0;
-          exportGridUca = 0;
+        if (!includeUnknown && activeSource === 'UNKNOWN') {
+          continue;
         }
 
-        sheet1.addRow({
-          timestamp: shiftedTime,
-          bessAsset: bessAsset.name,
-          emuId: row.emuId,
-          gridUab: exportGridUab,
-          gridUbc: exportGridUbc,
-          gridUca: exportGridUca,
-          bessUa: exportBessUa,
-          bessUb: exportBessUb,
-          bessUc: exportBessUc
-        }).commit();
+        const dataRow = [
+          formattedTime,
+          bessAsset.name,
+          row.emuId,
+          activeSource,
+          gridUab,
+          gridUbc,
+          gridUca,
+          bessUa,
+          bessUb,
+          bessUc,
+        ];
+        res.write(formatCsvRow(dataRow));
       }
 
       if (chunk.length < limit) {
@@ -693,8 +1364,7 @@ export class ReportExportService {
       }
     }
 
-    sheet1.commit();
-    await workbook.commit();
+    res.end();
   }
 
   async exportGridStateTrend(bessAssetId: string, from?: Date, to?: Date, res?: any) {
@@ -727,41 +1397,28 @@ export class ReportExportService {
       ORDER BY th."timestamp" ASC
     `;
 
-    const options = { stream: res, useStyles: true, useSharedStrings: true };
-    const workbook = new ExcelJS.stream.xlsx.WorkbookWriter(options);
-    const sheet1 = workbook.addWorksheet('Grid State Trend', { views: [{ state: 'frozen', xSplit: 0, ySplit: 11 }] });
+    // Metadata Rows (Rows 1-11)
+    res.write(formatCsvRow(['Grid State Trend Report']));
+    res.write(formatCsvRow(['Client Name:', bessAsset.site?.client?.name || 'Unknown Client']));
+    res.write(formatCsvRow(['Site Name:', bessAsset.site?.name || 'Unknown Site']));
+    res.write(formatCsvRow(['Site Identifier:', bessAsset.site?.businessIdentifier || 'N/A']));
+    res.write(formatCsvRow(['BESS Asset:', bessAsset.name]));
+    res.write(formatCsvRow(['BESS Identifier:', bessAsset.assetIdentifier || 'N/A']));
+    res.write(formatCsvRow(['EMU Serial No.:', bessAsset.emuId || 'N/A']));
+    res.write(formatCsvRow(['BESS Model:', bessAsset.model || 'N/A']));
+    res.write(formatCsvRow(['Energy Capacity:', bessAsset.energyCapacity != null ? bessAsset.energyCapacity + ' kWh' : 'N/A']));
+    res.write(formatCsvRow(['Power Rating:', bessAsset.powerRating != null ? bessAsset.powerRating + ' kW' : 'N/A']));
+    res.write(formatCsvRow([])); // Blank row 11
 
-    const r1 = sheet1.addRow(['Grid State Trend Report']);
-    r1.font = { bold: true };
-    const r2 = sheet1.addRow(['Client Name:', bessAsset.site?.client?.name || 'Unknown Client']);
-    const r3 = sheet1.addRow(['Site Name:', bessAsset.site?.name || 'Unknown Site']);
-    const r4 = sheet1.addRow(['Site Identifier:', bessAsset.site?.businessIdentifier || 'N/A']);
-    const r5 = sheet1.addRow(['BESS Asset:', bessAsset.name]);
-    const r6 = sheet1.addRow(['BESS Identifier:', bessAsset.assetIdentifier || 'N/A']);
-    const r7 = sheet1.addRow(['EMU Serial No.:', bessAsset.emuId || 'N/A']);
-    const r8 = sheet1.addRow(['BESS Model:', bessAsset.model || 'N/A']);
-    const r9 = sheet1.addRow(['Energy Capacity:', bessAsset.energyCapacity != null ? bessAsset.energyCapacity + ' kWh' : 'N/A']);
-    const r10 = sheet1.addRow(['Power Rating:', bessAsset.powerRating != null ? bessAsset.powerRating + ' kW' : 'N/A']);
-    sheet1.addRow([]); // Blank row 11
-    
-    [r2, r3, r4, r5, r6, r7, r8, r9, r10].forEach(row => {
-      row.getCell(1).font = { bold: true };
-      row.commit();
-    });
-    r1.commit();
-
-    const sheet1Columns: Partial<ExcelJS.Column>[] = [
-      { header: 'Time', key: 'timestamp', width: 22 },
-      { header: 'BESS Asset', key: 'bessAsset', width: 20 },
-      { header: 'EMU Serial No.', key: 'emuId', width: 20 },
-      { header: 'Grid ON State', key: 'gridOnState', width: 18 },
-      { header: 'Grid OFF State', key: 'gridOffState', width: 18 },
+    // Column Headers (Row 12)
+    const headers = [
+      'Timestamp',
+      'BESS Asset',
+      'EMU Serial No.',
+      'Grid ON State',
+      'Grid OFF State',
     ];
-    sheet1.columns = sheet1Columns.map((c) => ({ key: c.key, width: c.width }));
-    const headerRow = sheet1.addRow(sheet1Columns.map((c) => c.header));
-    headerRow.font = { bold: true };
-    headerRow.commit();
-    sheet1.getColumn('timestamp').numFmt = 'dd mmmm yyyy, hh:mm:ss.000 AM/PM';
+    res.write(formatCsvRow(headers));
 
     let offset = 0;
     const limit = 5000;
@@ -773,39 +1430,16 @@ export class ReportExportService {
 
       for (const row of chunk) {
         const bucketTime = row.timestamp as Date;
-        const ms = bucketTime.getUTCMilliseconds();
-        const formatter = new Intl.DateTimeFormat('en-US', {
-          timeZone: siteTimezone,
-          year: 'numeric',
-          month: 'numeric',
-          day: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-          second: '2-digit',
-          hourCycle: 'h23',
-        });
+        const formattedTime = formatSiteTimestamp(bucketTime, siteTimezone);
 
-        const parts = formatter.formatToParts(bucketTime);
-        const partMap: Record<string, string> = {};
-        for (const p of parts) partMap[p.type] = p.value;
-
-        const shiftedTime = new Date(Date.UTC(
-          parseInt(partMap.year, 10),
-          parseInt(partMap.month, 10) - 1,
-          parseInt(partMap.day, 10),
-          parseInt(partMap.hour, 10),
-          parseInt(partMap.minute, 10),
-          parseInt(partMap.second, 10),
-          ms
-        ));
-
-        sheet1.addRow({
-          timestamp: shiftedTime,
-          bessAsset: bessAsset.name,
-          emuId: row.emuId,
-          gridOnState: row.gridOnState,
-          gridOffState: row.gridOffState
-        }).commit();
+        const dataRow = [
+          formattedTime,
+          bessAsset.name,
+          row.emuId,
+          row.gridOnState,
+          row.gridOffState,
+        ];
+        res.write(formatCsvRow(dataRow));
       }
 
       if (chunk.length < limit) {
@@ -815,9 +1449,7 @@ export class ReportExportService {
       }
     }
 
-    sheet1.commit();
-    await workbook.commit();
+    res.end();
   }
 }
 export const reportExportService = new ReportExportService();
-

@@ -58,7 +58,12 @@ export default function LoginPage() {
 
       <div className="max-w-md w-full relative z-10 space-y-8 bg-white p-10 rounded-3xl shadow-2xl">
         <div className="text-center">
-          <h2 className="mt-2 text-3xl font-bold text-slate-900 tracking-tight">
+          <img
+            src="/Favgee.png"
+            alt="GoodEnough Energy Logo"
+            className="mx-auto h-12 w-auto object-contain mb-3"
+          />
+          <h2 className="text-3xl font-bold text-slate-900 tracking-tight">
             Sign In
           </h2>
           <p className="mt-2 text-sm text-slate-500">

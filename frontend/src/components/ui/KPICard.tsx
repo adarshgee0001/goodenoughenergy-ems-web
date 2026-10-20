@@ -21,8 +21,7 @@ export function KPICard({ title, value, icon }: KPICardProps) {
       initial={{ opacity: 0, y: 20 }}
       whileInView={{ opacity: 1, y: 0 }}
       viewport={{ once: true, amount: 0.3 }}
-      whileHover={{ y: -4, transition: { duration: 0.2 } }}
-      className="group relative bg-white p-6 rounded-2xl border border-slate-200 hover:border-primary-300 shadow-sm hover:shadow-xl transition-all duration-300 flex flex-col justify-between overflow-hidden"
+      className="group relative bg-white p-6 rounded-2xl border border-slate-200 hover:border-slate-300 shadow-sm transition-colors duration-150 ease-out flex flex-col justify-between overflow-hidden"
     >
       {/* Background subtle gradient on hover */}
       <div className="absolute inset-0 bg-gradient-to-br from-primary-50/0 to-primary-50/50 opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none" />

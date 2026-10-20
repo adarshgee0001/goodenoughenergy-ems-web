@@ -1,4 +1,4 @@
-import * as dotenv from 'dotenv';
+import 'dotenv/config';
 import * as http from 'http';
 import app from './app';
 import { mqttService } from './services/mqtt.service';
@@ -6,9 +6,6 @@ import { webSocketService } from './services/websocket.service';
 import { prisma } from './db/prisma';
 import { telemetrySnapshotService } from './services/telemetry-snapshot.service';
 import { retentionService } from './services/retention.service';
-
-// Load environment variables
-dotenv.config();
 
 const PORT = process.env.PORT || 5000;
 

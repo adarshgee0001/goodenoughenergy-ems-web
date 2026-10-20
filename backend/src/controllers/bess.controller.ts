@@ -2,6 +2,7 @@ import { Request, Response } from 'express';
 import { assetService } from '../services/asset.service';
 import { authorizationService } from '../services/authorization.service';
 import { mqttService } from '../services/mqtt.service';
+import { resolveVoltageTrend, VoltageTrendProcessor } from '../utils/voltage-trend.util';
 
 import { prisma as globalPrisma } from '../db/prisma';
 
@@ -95,7 +96,7 @@ export const createBess = async (req: Request, res: Response): Promise<void> => 
     const isAuthorized = await authorizationService.canAccessClient(req.user!.id, req.user!.role, clientId);
     if (!isAuthorized) return safeError(res, 'Forbidden: Access to site denied', 403);
 
-    const { name, assetIdentifier, emuId, model, energyCapacity, powerRating, mqttTopic } = req.body;
+    const { name, assetIdentifier, emuId, model, energyCapacity, powerRating, mqttTopic, reportIntervalMinutes } = req.body;
     if (!name || typeof name !== 'string' || name.trim() === '') return safeError(res, 'Valid BESS name is required', 400);
     if (!assetIdentifier || typeof assetIdentifier !== 'string' || assetIdentifier.trim() === '') return safeError(res, 'Valid assetIdentifier is required', 400);
 
@@ -108,17 +109,48 @@ export const createBess = async (req: Request, res: Response): Promise<void> => 
     if (!mqttTopic || typeof mqttTopic !== 'string' || mqttTopic.trim() === '') return safeError(res, 'Valid MQTT Topic is required', 400);
     const parsedMqttTopic = mqttTopic.trim();
 
-    const asset = await prisma.bESSAsset.create({
-      data: { 
-        name: name.trim(), 
-        assetIdentifier: assetIdentifier.trim(), 
-        siteId,
-        emuId: emuId && typeof emuId === 'string' && emuId.trim() !== '' ? emuId.trim() : null,
-        model: model && typeof model === 'string' ? model.trim() : null,
-        energyCapacity: parsedEnergy,
-        powerRating: parsedPower,
-        mqttTopic: parsedMqttTopic
+    let parsedReportInterval: number | undefined;
+    if (reportIntervalMinutes !== undefined) {
+      if (req.user?.role !== 'ADMIN') {
+        return safeError(res, 'Forbidden: Admin access required to set reporting interval', 403);
       }
+      const val = Number(reportIntervalMinutes);
+      if (!Number.isInteger(val) || val < 1 || val > 20) {
+        return safeError(res, 'reportIntervalMinutes must be an integer between 1 and 20', 400);
+      }
+      parsedReportInterval = val;
+    }
+
+    let commonInterval = parsedReportInterval;
+    if (commonInterval === undefined) {
+      const existingBess = await prisma.bESSAsset.findFirst({
+        where: { siteId },
+        select: { reportIntervalMinutes: true }
+      });
+      commonInterval = existingBess?.reportIntervalMinutes || 15;
+    }
+
+    const asset = await prisma.$transaction(async (tx: any) => {
+      if (parsedReportInterval !== undefined) {
+        await tx.bESSAsset.updateMany({
+          where: { siteId },
+          data: { reportIntervalMinutes: parsedReportInterval }
+        });
+      }
+
+      return await tx.bESSAsset.create({
+        data: {
+          name: name.trim(),
+          assetIdentifier: assetIdentifier.trim(),
+          siteId,
+          emuId: emuId && typeof emuId === 'string' && emuId.trim() !== '' ? emuId.trim() : null,
+          model: model && typeof model === 'string' ? model.trim() : null,
+          energyCapacity: parsedEnergy,
+          powerRating: parsedPower,
+          mqttTopic: parsedMqttTopic,
+          reportIntervalMinutes: commonInterval
+        }
+      });
     });
 
     if (asset.mqttTopic) {
@@ -150,7 +182,18 @@ export const updateBess = async (req: Request, res: Response): Promise<void> => 
     const isAuthorized = await authorizationService.canAccessClient(req.user!.id, req.user!.role, clientId);
     if (!isAuthorized) return safeError(res, 'Forbidden: Access to BESS asset denied', 403);
 
-    const { name, assetIdentifier, emuId, siteId: bodySiteId, model, energyCapacity, powerRating, mqttTopic } = req.body;
+    // Non-admin users (CLIENT, DISTRIBUTOR) are not authorized to modify BESS assets.
+    // Explicitly reject commissioning parameters and any BESS modifications by non-admins.
+    if (req.user?.role !== 'ADMIN') {
+      const restrictedFields = ['assetIdentifier', 'emuId', 'model', 'energyCapacity', 'powerRating', 'mqttTopic', 'reportIntervalMinutes', 'siteId'];
+      const hasRestrictedField = restrictedFields.some(field => req.body[field] !== undefined);
+      if (hasRestrictedField) {
+        return safeError(res, 'Forbidden: Admin access required to modify BESS commissioning parameters', 403);
+      }
+      return safeError(res, 'Forbidden: Admin access required to update BESS assets', 403);
+    }
+
+    const { name, assetIdentifier, emuId, siteId: bodySiteId, model, energyCapacity, powerRating, mqttTopic, reportIntervalMinutes } = req.body;
     
     const existingAsset = await prisma.bESSAsset.findUnique({where: {id: assetId}});
     if (bodySiteId && bodySiteId !== existingAsset.siteId) {
@@ -161,6 +204,17 @@ export const updateBess = async (req: Request, res: Response): Promise<void> => 
       ...(name && name.trim() !== '' ? { name: name.trim() } : {}),
       ...(assetIdentifier && assetIdentifier.trim() !== '' ? { assetIdentifier: assetIdentifier.trim() } : {})
     };
+
+    if (reportIntervalMinutes !== undefined) {
+      if (req.user?.role !== 'ADMIN') {
+        return safeError(res, 'Forbidden: Admin access required to change reporting interval', 403);
+      }
+      const parsedInterval = Number(reportIntervalMinutes);
+      if (!Number.isInteger(parsedInterval) || parsedInterval < 1 || parsedInterval > 20) {
+        return safeError(res, 'reportIntervalMinutes must be an integer between 1 and 20', 400);
+      }
+      dataToUpdate.reportIntervalMinutes = parsedInterval;
+    }
 
     if (emuId !== undefined) {
       dataToUpdate.emuId = emuId && typeof emuId === 'string' && emuId.trim() !== '' ? emuId.trim() : null;
@@ -195,9 +249,17 @@ export const updateBess = async (req: Request, res: Response): Promise<void> => 
       dataToUpdate.mqttTopic = mqttTopic.trim();
     }
 
-    const asset = await prisma.bESSAsset.update({
-      where: { id: assetId },
-      data: dataToUpdate
+    const asset = await prisma.$transaction(async (tx: any) => {
+      if (dataToUpdate.reportIntervalMinutes !== undefined) {
+        await tx.bESSAsset.updateMany({
+          where: { siteId: existingAsset.siteId },
+          data: { reportIntervalMinutes: dataToUpdate.reportIntervalMinutes }
+        });
+      }
+      return await tx.bESSAsset.update({
+        where: { id: assetId },
+        data: dataToUpdate
+      });
     });
 
     if (existingAsset && existingAsset.mqttTopic !== asset.mqttTopic) {
@@ -233,6 +295,10 @@ export const deleteBess = async (req: Request, res: Response): Promise<void> => 
 
     const isAuthorized = await authorizationService.canAccessClient(req.user!.id, req.user!.role, clientId);
     if (!isAuthorized) return safeError(res, 'Forbidden: Access to BESS asset denied', 403);
+
+    if (req.user?.role !== 'ADMIN') {
+      return safeError(res, 'Forbidden: Admin access required to delete BESS assets', 403);
+    }
 
     await prisma.bESSAsset.delete({ where: { id: assetId } });
     res.status(200).json({ success: true, message: 'BESS Asset deleted' });
@@ -289,9 +355,10 @@ export const getBessVoltageTrend = async (req: Request, res: Response): Promise<
 
     const telemetry = await prisma.telemetryHistory.findMany({
       where: whereClause,
-      orderBy: {
-        timestamp: 'asc'
-      },
+      orderBy: [
+        { timestamp: 'asc' },
+        { gridOnState: { sort: 'desc', nulls: 'last' } }
+      ],
       select: {
         timestamp: true,
         gridVoltageUab: true,
@@ -305,42 +372,47 @@ export const getBessVoltageTrend = async (req: Request, res: Response): Promise<
       }
     });
 
+    const processor = new VoltageTrendProcessor();
+
+    const lastKnownState = await prisma.telemetryHistory.findFirst({
+      where: {
+        device: { bessAssetId: assetId, componentId: 'pcs' },
+        timestamp: { lt: parsedStart },
+        OR: [
+          { gridOnState: { not: null } },
+          { gridOffState: { not: null } }
+        ]
+      },
+      orderBy: { timestamp: 'desc' },
+      select: { timestamp: true, gridOnState: true, gridOffState: true }
+    });
+
+    if (lastKnownState) {
+      processor.setInitialState(
+        lastKnownState.gridOnState,
+        lastKnownState.gridOffState,
+        lastKnownState.timestamp instanceof Date ? lastKnownState.timestamp.getTime() : new Date(lastKnownState.timestamp).getTime()
+      );
+    }
+
     const mappedTelemetry = telemetry.map((row: any) => {
-      const isGridActive = row.gridOnState === 1;
-      const isBessActive = row.gridOnState === 0 && row.gridOffState === 1;
-
-      if (isGridActive) {
-        return {
-          timestamp: row.timestamp,
-          gridVoltageUab: row.gridVoltageUab,
-          gridVoltageUbc: row.gridVoltageUbc,
-          gridVoltageUca: row.gridVoltageUca,
-          bessVoltageUa: 0,
-          bessVoltageUb: 0,
-          bessVoltageUc: 0,
-        };
-      }
-
-      if (isBessActive) {
-        return {
-          timestamp: row.timestamp,
-          gridVoltageUab: 0,
-          gridVoltageUbc: 0,
-          gridVoltageUca: 0,
-          bessVoltageUa: row.bessVoltageUa,
-          bessVoltageUb: row.bessVoltageUb,
-          bessVoltageUc: row.bessVoltageUc,
-        };
-      }
+      const { activeSource, gridUab, gridUbc, gridUca, bessUa, bessUb, bessUc } = processor.processRow(row);
 
       return {
         timestamp: row.timestamp,
-        gridVoltageUab: row.gridVoltageUab,
-        gridVoltageUbc: row.gridVoltageUbc,
-        gridVoltageUca: row.gridVoltageUca,
-        bessVoltageUa: row.bessVoltageUa,
-        bessVoltageUb: row.bessVoltageUb,
-        bessVoltageUc: row.bessVoltageUc,
+        activeSource,
+        gridVoltageUab: gridUab,
+        gridVoltageUbc: gridUbc,
+        gridVoltageUca: gridUca,
+        bessVoltageUa: bessUa,
+        bessVoltageUb: bessUb,
+        bessVoltageUc: bessUc,
+        rawGridVoltageUab: row.gridVoltageUab,
+        rawGridVoltageUbc: row.gridVoltageUbc,
+        rawGridVoltageUca: row.gridVoltageUca,
+        rawBessVoltageUa: row.bessVoltageUa,
+        rawBessVoltageUb: row.bessVoltageUb,
+        rawBessVoltageUc: row.bessVoltageUc,
       };
     });
 

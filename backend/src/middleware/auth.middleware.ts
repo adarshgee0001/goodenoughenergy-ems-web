@@ -16,6 +16,7 @@ declare global {
         name: string;
         role: string;
       };
+      authExp?: number;
     }
   }
 }
@@ -44,6 +45,11 @@ export const authenticateUser = async (
       return;
     }
 
+    if (decoded.exp && (decoded.exp * 1000) <= Date.now()) {
+      res.status(401).json({ success: false, message: 'Invalid or expired token' });
+      return;
+    }
+
     // Fetch the safe user profile from PostgreSQL
     const user = await prisma.user.findUnique({
       where: { id: decoded.userId },
@@ -62,6 +68,7 @@ export const authenticateUser = async (
 
     // Attach user to request context
     req.user = user;
+    req.authExp = decoded.exp ? decoded.exp * 1000 : undefined;
     next();
   } catch (error) {
     console.error('[Auth Middleware] Error:', error);

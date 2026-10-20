@@ -1,32 +1,57 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { Area, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, AreaChart, ReferenceLine } from 'recharts';
 import type { PowerTrendPoint } from '../../../features/dashboard/dashboard.types';
+import type { PowerUnit, TimeFormat, DateFormat } from '../../../features/settings/settings.types';
+import { formatDateCustom, formatTimeCustom, formatDateTimeCustom, getDateParts, getNextHourInTz } from '../../../features/settings/settings.utils';
 
 interface PowerTrendChartProps {
   data: PowerTrendPoint[];
   title?: string;
   description?: string;
   domain: [number, number];
+  powerUnit?: PowerUnit;
+  timeFormat?: TimeFormat;
+  dateFormat?: DateFormat;
+  timeZone?: string;
 }
 
-const CustomTooltip = ({ active, payload, label }: any) => {
+const CustomTooltip = ({
+  active,
+  payload,
+  label,
+  isMW = false,
+  timeFormat = '12h',
+  dateFormat = 'DD MMM YYYY',
+  durationHours = 24,
+  timeZone,
+}: any) => {
   if (active && payload && payload.length) {
-    const timeLabel = new Date(label).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const timeLabel = durationHours <= 26
+      ? formatTimeCustom(label, timeFormat, false, timeZone)
+      : formatDateTimeCustom(label, dateFormat, timeFormat, false, timeZone);
+    const unit = isMW ? 'MW' : 'kW';
     return (
       <div className="bg-white p-3 border border-slate-200 shadow-md rounded-lg min-w-[180px]">
         <p className="text-sm font-bold text-slate-900 mb-2 border-b border-slate-100 pb-2">{timeLabel}</p>
         <div className="space-y-1.5">
-          {payload.map((entry: any, index: number) => (
-            <div key={index} className="flex items-center justify-between gap-4">
-              <div className="flex items-center gap-2">
-                <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: entry.color }} />
-                <span className="text-sm font-medium text-slate-600">{entry.name}</span>
+          {payload.map((entry: any, index: number) => {
+            const isSoc = entry.dataKey === 'soc';
+            const decimals = isSoc ? 1 : isMW ? 2 : 1;
+            const displayVal = entry.value !== null && entry.value !== undefined
+              ? `${Number(entry.value).toFixed(decimals)} ${isSoc ? '%' : unit}`
+              : '-- (No data)';
+            return (
+              <div key={index} className="flex items-center justify-between gap-4">
+                <div className="flex items-center gap-2">
+                  <div className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: entry.color }} />
+                  <span className="text-sm font-medium text-slate-600">{entry.name}</span>
+                </div>
+                <span className="text-sm font-bold text-slate-900">
+                  {displayVal}
+                </span>
               </div>
-              <span className="text-sm font-bold text-slate-900">
-                {entry.value !== null && entry.value !== undefined ? `${Number(entry.value).toFixed(1)} ${entry.dataKey === 'soc' ? '%' : 'kW'}` : '--'}
-              </span>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     );
@@ -39,9 +64,25 @@ export const PowerTrendChart = ({
   title = 'Power Flow',
   description = 'Grid and battery power over the last 24 hours',
   domain,
+  powerUnit = 'kW',
+  timeFormat = '12h',
+  dateFormat = 'DD MMM YYYY',
+  timeZone,
 }: PowerTrendChartProps) => {
+  const isMW = powerUnit === 'MW';
   const hasData = data.length > 0;
   const [hoveredLine, setHoveredLine] = useState<string | null>(null);
+
+  const chartData = useMemo(() => {
+    if (!isMW) return data;
+    return data.map(pt => ({
+      ...pt,
+      grid: pt.grid !== undefined && pt.grid !== null ? pt.grid / 1000 : pt.grid,
+      bess: pt.bess !== undefined && pt.bess !== null ? pt.bess / 1000 : pt.bess,
+      solar: pt.solar !== undefined && pt.solar !== null ? pt.solar / 1000 : pt.solar,
+      soc: pt.soc, // Preserved as %
+    }));
+  }, [data, isMW]);
   
   const durationMs = domain[1] - domain[0];
   const durationHours = durationMs / (1000 * 60 * 60);
@@ -59,13 +100,8 @@ export const PowerTrendChart = ({
   }
 
   const xTicks = [];
-  const start = new Date(domain[0]);
-  start.setMinutes(0, 0, 0);
-  if (start.getTime() < domain[0]) {
-    start.setHours(start.getHours() + 1);
-  }
-  
-  for (let t = start.getTime(); t <= domain[1]; t += tickIntervalHours * 60 * 60 * 1000) {
+  const startTs = getNextHourInTz(domain[0], timeZone);
+  for (let t = startTs; t <= domain[1]; t += tickIntervalHours * 60 * 60 * 1000) {
     xTicks.push(t);
   }
 
@@ -97,7 +133,7 @@ export const PowerTrendChart = ({
       ) : (
         <div className="flex-1 w-full min-h-[340px]">
           <ResponsiveContainer width="100%" height="100%">
-            <AreaChart data={data} margin={{ top: 20, right: 20, left: 10, bottom: 20 }}>
+            <AreaChart data={chartData} margin={{ top: 20, right: 20, left: 10, bottom: 20 }}>
               <defs>
                 <linearGradient id="colorGrid" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%" stopColor="#334155" stopOpacity={0.3} />
@@ -128,17 +164,21 @@ export const PowerTrendChart = ({
                 tickFormatter={(val) => {
                   const d = new Date(val);
                   if (durationDays > 7) {
-                    return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+                    return formatDateCustom(d, dateFormat, timeZone);
                   } else if (durationDays > 2) {
-                    return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                    return formatDateTimeCustom(d, dateFormat, timeFormat, false, timeZone);
                   } else if (durationHours <= 26) {
-                    const hours = d.getHours();
+                    const parts = getDateParts(d, timeZone);
+                    if (timeFormat === '24h') {
+                      return `${parts.hours24.toString().padStart(2, '0')}:00`;
+                    }
+                    const hours = parts.hours24;
                     const ampm = hours >= 12 ? 'PM' : 'AM';
                     const hour12 = hours % 12 || 12;
                     const paddedHour = hour12 < 10 ? `0${hour12}` : hour12;
                     return `${paddedHour} ${ampm}`;
                   }
-                  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                  return formatTimeCustom(d, timeFormat, false, timeZone);
                 }}
                 interval={durationHours <= 26 ? 0 : "preserveEnd"}
                 minTickGap={durationHours <= 26 ? 0 : 30}
@@ -153,16 +193,21 @@ export const PowerTrendChart = ({
                 tickLine={false}
               />
               <YAxis
+                label={{ value: isMW ? 'Power (MW)' : 'Power (kW)', angle: -90, position: 'insideLeft', offset: 0, fill: '#64748b', fontSize: 12 }}
                 tick={{ fill: '#64748b', fontSize: 12 }}
                 axisLine={false}
                 tickLine={false}
-                tickFormatter={(value) => `${value}`}
-                width={50}
+                tickFormatter={(value) => `${Number(value.toFixed(2))}`}
+                width={isMW ? 55 : 50}
                 domain={([dataMin, dataMax]: any) => {
                   const maxAbs = Math.max(Math.abs(dataMin || 0), Math.abs(dataMax || 0));
-                  // Add a minimum scale (e.g. 10) so it doesn't zoom in completely flat when everything is 0
+                  if (isMW) {
+                    const scale = Math.max(maxAbs, 0.01);
+                    const step = scale > 1 ? 0.5 : scale > 0.1 ? 0.05 : 0.01;
+                    const rounded = Number((Math.ceil(scale / step) * step).toFixed(2));
+                    return [-rounded, rounded];
+                  }
                   const scale = Math.max(maxAbs, 10);
-                  // Ensure nice rounded bounds
                   const rounded = Math.ceil(scale / 10) * 10;
                   return [-rounded, rounded];
                 }}
@@ -183,7 +228,18 @@ export const PowerTrendChart = ({
                 hide={true}
                 domain={[0, 'auto']}
               />
-              <Tooltip content={<CustomTooltip />} cursor={{ stroke: '#94a3b8', strokeWidth: 1, strokeDasharray: '4 4' }} />
+              <Tooltip
+                content={
+                  <CustomTooltip
+                    isMW={isMW}
+                    timeFormat={timeFormat}
+                    dateFormat={dateFormat}
+                    durationHours={durationHours}
+                    timeZone={timeZone}
+                  />
+                }
+                cursor={{ stroke: '#94a3b8', strokeWidth: 1, strokeDasharray: '4 4' }}
+              />
               
               <Legend 
                 verticalAlign="top" 
