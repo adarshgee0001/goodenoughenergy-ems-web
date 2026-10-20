@@ -329,7 +329,11 @@ describe('Authoritative Reports Table & CSV Export Verification', () => {
     expect(dataLine).toContain('80');          // Solar Power (kW)
 
     // Save and verify physical CSV file
-    const outCsvPath = path.resolve(__dirname, '../../scripts/scratch/test-single-bess-verified.csv');
+    const scratchDir = path.resolve(__dirname, '../../scripts/scratch');
+    if (!fs.existsSync(scratchDir)) {
+      fs.mkdirSync(scratchDir, { recursive: true });
+    }
+    const outCsvPath = path.resolve(scratchDir, 'test-single-bess-verified.csv');
     fs.writeFileSync(outCsvPath, mockRes.getContent(), 'utf8');
     const diskCsv = fs.readFileSync(outCsvPath, 'utf8');
     expect(diskCsv).toBe(mockRes.getContent());
@@ -544,7 +548,11 @@ describe('Authoritative Reports Table & CSV Export Verification', () => {
     expect(sumRow12.getCell(12).value).toBeNull();
 
     // Save and verify physical XLSX workbook file on disk
-    const outXlsxPath = path.resolve(__dirname, '../../scripts/scratch/test-multi-bess-verified.xlsx');
+    const scratchDir = path.resolve(__dirname, '../../scripts/scratch');
+    if (!fs.existsSync(scratchDir)) {
+      fs.mkdirSync(scratchDir, { recursive: true });
+    }
+    const outXlsxPath = path.resolve(scratchDir, 'test-multi-bess-verified.xlsx');
     fs.writeFileSync(outXlsxPath, mockRes.getBuffer());
     const diskWorkbook = new ExcelJS.Workbook();
     await diskWorkbook.xlsx.readFile(outXlsxPath);
