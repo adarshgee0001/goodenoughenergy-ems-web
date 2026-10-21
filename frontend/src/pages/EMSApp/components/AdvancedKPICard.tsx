@@ -46,8 +46,7 @@ export const AdvancedKPICard = ({
       initial={{ opacity: 0, y: 15 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.4, delay, ease: 'easeOut' }}
-      whileHover={{ y: -2, transition: { duration: 0.2 } }}
-      className="bg-white rounded-xl p-5 shadow-sm border border-slate-200 hover:shadow-md transition-shadow relative overflow-hidden group"
+      className="bg-white rounded-xl p-5 shadow-sm border border-slate-200 hover:border-slate-300 transition-colors duration-150 ease-out relative overflow-hidden group"
     >
       {/* Subtle hover gradient */}
       <div className="absolute inset-0 bg-gradient-to-br from-white to-slate-50 opacity-0 group-hover:opacity-100 transition-opacity duration-300 pointer-events-none" />

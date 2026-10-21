@@ -41,6 +41,9 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       role: user.role,
     });
 
+    const decoded = authService.verifyToken(token);
+    const expiresAt = decoded.exp ? decoded.exp * 1000 : Date.now() + 24 * 60 * 60 * 1000;
+
     // Set HttpOnly cookie
     const isProduction = process.env.NODE_ENV === 'production';
     res.cookie('auth_token', token, {
@@ -51,6 +54,15 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       maxAge: 24 * 60 * 60 * 1000 // 1 day
     });
 
+    let clientId: string | undefined;
+    if (user.role === 'CLIENT' && prisma.userClientAccess?.findFirst) {
+      const access = await prisma.userClientAccess.findFirst({
+        where: { userId: user.id },
+        select: { clientId: true }
+      });
+      clientId = access?.clientId;
+    }
+
     // Return safe user payload (no token)
     res.status(200).json({
       success: true,
@@ -60,7 +72,9 @@ export const login = async (req: Request, res: Response): Promise<void> => {
         name: user.name,
         role: user.role,
         forcePasswordChange: user.forcePasswordChange,
+        clientId,
       },
+      expiresAt,
     });
   } catch (error) {
     console.error('[Auth Controller - Login] Error:', error);
@@ -76,12 +90,23 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
+    let clientId: string | undefined;
+    if (req.user.role === 'CLIENT' && prisma.userClientAccess?.findFirst) {
+      const access = await prisma.userClientAccess.findFirst({
+        where: { userId: req.user.id },
+        select: { clientId: true }
+      });
+      clientId = access?.clientId;
+    }
+
     res.status(200).json({
       success: true,
       user: {
         ...req.user,
-        forcePasswordChange: (await prisma.user.findUnique({ where: { id: req.user.id } }))?.forcePasswordChange
+        forcePasswordChange: (await prisma.user.findUnique({ where: { id: req.user.id } }))?.forcePasswordChange,
+        clientId,
       },
+      expiresAt: req.authExp,
     });
   } catch (error) {
     console.error('[Auth Controller - getMe] Error:', error);

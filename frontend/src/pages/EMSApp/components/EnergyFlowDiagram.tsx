@@ -1,15 +1,21 @@
 import { motion } from 'framer-motion';
 import { Zap, BatteryMedium, Cpu } from 'lucide-react';
 import type { DashboardTelemetryState } from '../../../features/dashboard/dashboard.types';
+import type { PowerUnit } from '../../../features/settings/settings.types';
+import { formatPowerDisplay } from '../../../features/settings/settings.utils';
 
 interface EnergyFlowDiagramProps {
   data: DashboardTelemetryState;
+  powerUnit?: PowerUnit;
   /**
    * When true, the telemetry data is older than the freshness threshold.
    * Numeric values are masked to '--' and flow animations are suppressed.
    * Underlying data and sign semantics are unchanged.
    */
   isStale?: boolean;
+  isGridStale?: boolean;
+  isBessStale?: boolean;
+  isSolarStale?: boolean;
 }
 
 const NodeCard = ({
@@ -36,28 +42,43 @@ const NodeCard = ({
   </div>
 );
 
-export const EnergyFlowDiagram = ({ data, isStale = false }: EnergyFlowDiagramProps) => {
+export const EnergyFlowDiagram = ({
+  data,
+  powerUnit,
+  isStale = false,
+  isGridStale,
+  isBessStale,
+  isSolarStale,
+}: EnergyFlowDiagramProps) => {
+  const effectiveGridStale = isGridStale ?? isStale;
+  const effectiveBessStale = isBessStale ?? isStale;
+  const effectiveSolarStale = isSolarStale ?? isStale;
+
+  const unitLabel = powerUnit || 'kW';
+
   // Grid — real source: pmg.ai_sum_p → gridPower
   const gridPower = data.gridPower;
-  const isGridImporting = !isStale && gridPower !== undefined && gridPower > 0;
-  const isGridExporting = !isStale && gridPower !== undefined && gridPower < 0;
-  const gridDisplay = isStale ? '--' : (gridPower !== undefined ? `${Math.abs(gridPower)}` : '--');
+  const isGridImporting = !effectiveGridStale && gridPower !== undefined && gridPower > 0;
+  const isGridExporting = !effectiveGridStale && gridPower !== undefined && gridPower < 0;
+  const gridDisplay = effectiveGridStale
+    ? '--'
+    : (gridPower !== undefined ? formatPowerDisplay(Math.abs(gridPower), unitLabel).displayValue : '--');
 
   // BESS — real source: pcs.ai_p → bessPower
   // Sign semantics: positive = Charging, negative = Discharging, zero = Idle
   // Math.abs() is ONLY used for display magnitude; sign logic below is preserved.
   const bessPower = data.bessPower;
-  const isBessCharging = !isStale && bessPower !== undefined && bessPower > 0;
-  const isBessDischarging = !isStale && bessPower !== undefined && bessPower < 0;
-  const bessDisplay = isStale ? '--' : (bessPower !== undefined ? `${bessPower}` : '--');
+  const isBessCharging = !effectiveBessStale && bessPower !== undefined && bessPower > 0;
+  const isBessDischarging = !effectiveBessStale && bessPower !== undefined && bessPower < 0;
+  const bessDisplay = effectiveBessStale ? '--' : formatPowerDisplay(bessPower, unitLabel).displayValue;
 
   // SOC — no confirmed source in Phase 14C; omitted from UI
 
   // Solar — confirmed source: pinv.ai_op_p → solarPower (Step 1)
   // Sign convention: always positive (generation). No BESS sign semantics.
   const solarPower = data.solarPower;
-  const isSolarActive = !isStale && solarPower !== undefined && solarPower > 0;
-  const solarDisplay = isStale ? '--' : (solarPower !== undefined ? `${solarPower}` : '--');
+  const isSolarActive = !effectiveSolarStale && solarPower !== undefined && solarPower > 0;
+  const solarDisplay = effectiveSolarStale ? '--' : formatPowerDisplay(solarPower, unitLabel).displayValue;
 
   const flowTransition = {
     duration: 1.5,
@@ -65,11 +86,13 @@ export const EnergyFlowDiagram = ({ data, isStale = false }: EnergyFlowDiagramPr
     ease: 'linear' as const,
   };
 
+  const isAllStale = effectiveGridStale && effectiveBessStale && effectiveSolarStale;
+
   return (
     <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6 flex flex-col h-full w-full overflow-hidden">
       <div className="flex justify-between items-center mb-6 z-10">
         <h3 className="text-lg font-semibold text-slate-900">Energy Flow</h3>
-        {isStale ? (
+        {isAllStale ? (
           <span className="text-xs font-medium px-2.5 py-1 bg-amber-50 text-amber-700 rounded-full flex items-center gap-1.5 border border-amber-100">
             <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
             Stale Data
@@ -139,10 +162,10 @@ export const EnergyFlowDiagram = ({ data, isStale = false }: EnergyFlowDiagramPr
               </div>
               <div className="p-4 text-center flex flex-col justify-center min-h-[80px]">
                 <div className="text-xl sm:text-2xl font-bold text-slate-900 leading-none mb-1">
-                  {solarDisplay} <span className="text-xs sm:text-sm text-slate-500 font-medium">{(!isStale && solarPower !== undefined) ? 'kW' : ''}</span>
+                  {solarDisplay} <span className="text-xs sm:text-sm text-slate-500 font-medium">{(!effectiveSolarStale && solarDisplay !== '--') ? unitLabel : ''}</span>
                 </div>
                 <div className={`text-[10px] sm:text-xs uppercase tracking-wider font-bold ${isSolarActive ? 'text-amber-500' : 'text-slate-400'}`}>
-                  {isStale ? 'Stale' : (solarPower !== undefined ? (isSolarActive ? 'Generating' : 'Idle') : 'No Data')}
+                  {effectiveSolarStale ? 'Stale' : (solarPower !== undefined ? (isSolarActive ? 'Generating' : 'Idle') : 'No Data')}
                 </div>
               </div>
             </div>
@@ -155,15 +178,15 @@ export const EnergyFlowDiagram = ({ data, isStale = false }: EnergyFlowDiagramPr
               <NodeCard
                 title="Grid"
                 value={gridDisplay}
-                unit={(!isStale && gridPower !== undefined) ? 'kW' : ''}
+                unit={(!effectiveGridStale && gridDisplay !== '--') ? unitLabel : ''}
                 stateText={
-                  isStale
+                  effectiveGridStale
                     ? 'Stale'
                     : gridPower !== undefined && gridPower !== 0 ? 'Active' : gridPower === 0 ? 'Idle' : 'No Data'
                 }
                 icon={Zap}
-                borderClass={(!isStale && gridPower !== undefined && gridPower !== 0) ? 'border-amber-500' : 'border-slate-200'}
-                colorClass={(!isStale && gridPower !== undefined && gridPower !== 0) ? 'text-amber-600' : 'text-slate-400'}
+                borderClass={(!effectiveGridStale && gridPower !== undefined && gridPower !== 0) ? 'border-amber-500' : 'border-slate-200'}
+                colorClass={(!effectiveGridStale && gridPower !== undefined && gridPower !== 0) ? 'text-amber-600' : 'text-slate-400'}
               />
             </div>
 
@@ -179,16 +202,16 @@ export const EnergyFlowDiagram = ({ data, isStale = false }: EnergyFlowDiagramPr
             {/* BESS */}
             <div className="col-start-3">
               <div className="flex flex-col bg-white border border-slate-200 rounded-xl shadow-sm w-36 sm:w-44 overflow-hidden z-10">
-                <div className={`flex items-center justify-between px-4 py-2 border-b-2 bg-slate-50 ${(!isStale && bessPower !== undefined && bessPower !== 0) ? 'border-blue-500' : 'border-slate-200'}`}>
+                <div className={`flex items-center justify-between px-4 py-2 border-b-2 bg-slate-50 ${(!effectiveBessStale && bessPower !== undefined && bessPower !== 0) ? 'border-blue-500' : 'border-slate-200'}`}>
                   <span className="font-semibold text-xs tracking-wider uppercase text-slate-700">BESS</span>
-                  <BatteryMedium className={`w-4 h-4 ${(!isStale && bessPower !== undefined && bessPower !== 0) ? 'text-blue-600' : 'text-slate-400'}`} />
+                  <BatteryMedium className={`w-4 h-4 ${(!effectiveBessStale && bessPower !== undefined && bessPower !== 0) ? 'text-blue-600' : 'text-slate-400'}`} />
                 </div>
                 <div className="p-4 text-center flex flex-col justify-center min-h-[80px]">
                   <div className="text-xl sm:text-2xl font-bold text-slate-900 leading-none mb-1">
-                    {bessDisplay} <span className="text-xs sm:text-sm text-slate-500 font-medium">{(!isStale && bessPower !== undefined) ? 'kW' : ''}</span>
+                    {bessDisplay} <span className="text-xs sm:text-sm text-slate-500 font-medium">{(!effectiveBessStale && bessDisplay !== '--') ? unitLabel : ''}</span>
                   </div>
-                  <div className={`text-[10px] sm:text-xs uppercase tracking-wider font-bold mb-2 ${(!isStale && bessPower !== undefined && bessPower !== 0) ? 'text-blue-600' : 'text-slate-400'}`}>
-                    {isStale ? 'Stale' : (isBessDischarging ? 'Discharging' : isBessCharging ? 'Charging' : bessPower === 0 ? 'Idle' : 'No Data')}
+                  <div className={`text-[10px] sm:text-xs uppercase tracking-wider font-bold mb-2 ${(!effectiveBessStale && bessPower !== undefined && bessPower !== 0) ? 'text-blue-600' : 'text-slate-400'}`}>
+                    {effectiveBessStale ? 'Stale' : (isBessDischarging ? 'Discharging' : isBessCharging ? 'Charging' : bessPower === 0 ? 'Idle' : 'No Data')}
                   </div>
                 </div>
               </div>

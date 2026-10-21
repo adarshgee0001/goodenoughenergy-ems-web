@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
-import { useParams, Link } from 'react-router-dom';
-import { ArrowLeft, Plus, Cpu, AlertCircle, Loader2, Edit2, Trash2 } from 'lucide-react';
+import { useParams, Link, useNavigate } from 'react-router-dom';
+import { ArrowLeft, Plus, Cpu, AlertCircle, Loader2, Edit2, Trash2, Eye } from 'lucide-react';
+import { usePreview } from '../../context/PreviewContext';
 import { bessService } from '../../features/bess/bess.service';
 import type { BessAsset } from '../../features/bess/bess.types';
 import { deviceService } from '../../features/devices/device.service';
@@ -13,6 +14,8 @@ import { GridStateTrendSection } from '../EMSApp/components/GridStateTrendSectio
 
 export default function BessDetailsPage() {
   const { clientId, siteId, assetId } = useParams<{ clientId: string; siteId: string; assetId: string }>();
+  const navigate = useNavigate();
+  const { startPreview } = usePreview();
 
   const [asset, setAsset] = useState<BessAsset | null>(null);
   const [isAssetLoading, setIsAssetLoading] = useState(true);
@@ -27,6 +30,38 @@ export default function BessDetailsPage() {
   const [selectedDeviceForEdit, setSelectedDeviceForEdit] = useState<Device | null>(null);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [selectedDeviceForDelete, setSelectedDeviceForDelete] = useState<Device | null>(null);
+
+  const [isIntervalUpdating, setIsIntervalUpdating] = useState(false);
+  const [intervalSuccess, setIntervalSuccess] = useState(false);
+  const [intervalError, setIntervalError] = useState<string | null>(null);
+
+  const handleIntervalChange = async (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const newInterval = parseInt(e.target.value, 10);
+    if (!asset || isNaN(newInterval)) return;
+    setIsIntervalUpdating(true);
+    setIntervalSuccess(false);
+    setIntervalError(null);
+    try {
+      const updated = await bessService.updateBess(
+        asset.id,
+        asset.name,
+        asset.assetIdentifier,
+        asset.emuId,
+        asset.model,
+        asset.energyCapacity,
+        asset.powerRating,
+        asset.mqttTopic,
+        newInterval
+      );
+      setAsset(updated);
+      setIntervalSuccess(true);
+      setTimeout(() => setIntervalSuccess(false), 3000);
+    } catch (err: any) {
+      setIntervalError(err.message || 'Failed to update interval');
+    } finally {
+      setIsIntervalUpdating(false);
+    }
+  };
 
   const fetchAsset = useCallback(async () => {
     if (!assetId) return;
@@ -120,14 +155,29 @@ export default function BessDetailsPage() {
     <div className="space-y-8 max-w-5xl mx-auto">
       {/* Header */}
       <div>
-        <div className="flex items-center gap-4 mb-6">
-          <Link to={`/admin/clients/${clientId}/sites/${siteId}`} className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors" title="Back to Site">
-            <ArrowLeft className="w-5 h-5" />
-          </Link>
-          <div>
-            <h1 className="text-2xl font-bold text-slate-900">{asset.name}</h1>
-            <p className="text-slate-500 mt-1">BESS Asset · Device Management</p>
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-4">
+            <Link to={`/admin/clients/${clientId}/sites/${siteId}`} className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors" title="Back to Site">
+              <ArrowLeft className="w-5 h-5" />
+            </Link>
+            <div>
+              <h1 className="text-2xl font-bold text-slate-900">{asset.name}</h1>
+              <p className="text-slate-500 mt-1">BESS Asset · Device Management</p>
+            </div>
           </div>
+          {clientId && (
+            <button
+              onClick={() => {
+                startPreview(clientId, asset.name);
+                navigate('/app/reports');
+              }}
+              className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg font-medium transition-colors border border-indigo-200 shadow-sm"
+              title="Preview this client in Reports"
+            >
+              <Eye className="w-4 h-4" />
+              Preview Client Reports
+            </button>
+          )}
         </div>
 
         <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm flex flex-col md:flex-row md:items-center gap-6">
@@ -144,6 +194,29 @@ export default function BessDetailsPage() {
           <div className="flex-1">
             <p className="text-sm font-medium text-slate-500 mb-1">Asset ID</p>
             <p className="text-slate-600 font-mono text-sm">{asset.id}</p>
+          </div>
+          <div className="flex-1">
+            <label htmlFor="bess-report-interval" className="text-sm font-medium text-slate-500 mb-1 block">
+              Report Interval
+            </label>
+            <div className="flex items-center gap-2">
+              <select
+                id="bess-report-interval"
+                value={asset.reportIntervalMinutes || 15}
+                onChange={handleIntervalChange}
+                disabled={isIntervalUpdating}
+                className="bg-slate-50 border border-slate-300 rounded-lg px-2.5 py-1 text-sm font-medium text-slate-900 focus:ring-2 focus:ring-primary-500 cursor-pointer disabled:opacity-50"
+              >
+                {[...Array(20)].map((_, i) => (
+                  <option key={i + 1} value={i + 1}>
+                    {i + 1} min
+                  </option>
+                ))}
+              </select>
+              {isIntervalUpdating && <Loader2 className="w-4 h-4 animate-spin text-primary-600" />}
+              {intervalSuccess && <span className="text-xs text-emerald-600 font-medium">Saved</span>}
+              {intervalError && <span className="text-xs text-red-600 font-medium">{intervalError}</span>}
+            </div>
           </div>
         </div>
       </div>

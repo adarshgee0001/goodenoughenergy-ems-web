@@ -4,9 +4,11 @@ import { dashboardService } from '../../features/dashboard/dashboard.service';
 import type { DashboardSite, DashboardBessAsset } from '../../features/dashboard/dashboard.types';
 import { MapPin, BatteryMedium, Activity, ChevronRight, ChevronLeft, Loader2, AlertCircle } from 'lucide-react';
 import { KPICard } from './components/EMSKPICard';
+import { useUserSettings } from '../../features/settings/hooks/useUserSettings';
 
 export default function SiteDetailsPage() {
   const { siteId } = useParams<{ siteId: string }>();
+  const { preferences, formatEnergy, formatPower, setActiveSiteTimezone } = useUserSettings();
   const [site, setSite] = useState<DashboardSite | null>(null);
   const [assets, setAssets] = useState<DashboardBessAsset[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -35,6 +37,12 @@ export default function SiteDetailsPage() {
     loadData();
   }, [siteId]);
 
+  useEffect(() => {
+    if (site?.timezone) {
+      setActiveSiteTimezone(site.timezone);
+    }
+  }, [site?.timezone, setActiveSiteTimezone]);
+
   if (isLoading) {
     return (
       <div className="flex flex-col items-center justify-center min-h-[60vh]">
@@ -60,16 +68,28 @@ export default function SiteDetailsPage() {
   }
 
   // Calculate static derived capacity from available assets
-  const hasAnyEnergyCapacity = assets.some(asset => (asset as any).energyCapacity !== null && (asset as any).energyCapacity !== undefined);
-  const hasAnyPowerRating = assets.some(asset => (asset as any).powerRating !== null && (asset as any).powerRating !== undefined);
+  const hasAnyEnergyCapacity = assets.some(asset => asset.energyCapacity !== null && asset.energyCapacity !== undefined);
+  const hasAnyPowerRating = assets.some(asset => asset.powerRating !== null && asset.powerRating !== undefined);
 
   const totalEnergyCapacity = hasAnyEnergyCapacity 
-    ? assets.reduce((sum, asset) => sum + ((asset as any).energyCapacity || 0), 0)
+    ? assets.reduce((sum, asset) => sum + (asset.energyCapacity || 0), 0)
     : null;
 
   const totalPowerRating = hasAnyPowerRating
-    ? assets.reduce((sum, asset) => sum + ((asset as any).powerRating || 0), 0)
+    ? assets.reduce((sum, asset) => sum + (asset.powerRating || 0), 0)
     : null;
+
+  const energyFormatted = formatEnergy(totalEnergyCapacity);
+  const powerFormatted = formatPower(totalPowerRating);
+
+  const isSingleBess = assets.length === 1;
+  const isMultiBess = assets.length > 1;
+
+  const energyCapacityTitle = isSingleBess ? 'Energy Capacity' : 'Total Energy Capacity';
+  const powerRatingTitle = isSingleBess ? 'Power Rating' : 'Total Power Rating';
+
+  const energyCapacitySubtitle = isMultiBess ? 'Sum of asset ratings' : undefined;
+  const powerRatingSubtitle = isMultiBess ? 'Sum of asset ratings' : undefined;
 
   return (
     <div className="space-y-6">
@@ -95,17 +115,17 @@ export default function SiteDetailsPage() {
           value={site.timezone || '--'} 
           icon={<MapPin className="w-5 h-5" />} 
         />
-        <KPICard 
-          title="Total Energy Capacity" 
-          value={totalEnergyCapacity !== null ? `${totalEnergyCapacity.toLocaleString()} kWh` : '--'} 
-          subtitle="Sum of asset ratings"
-          icon={<BatteryMedium className="w-5 h-5" />} 
+        <KPICard
+          title={energyCapacityTitle}
+          value={energyFormatted.displayValue !== '--' ? `${Number(energyFormatted.displayValue).toLocaleString()} ${energyFormatted.unit}` : '--'}
+          subtitle={energyCapacitySubtitle}
+          icon={<BatteryMedium className="w-5 h-5" />}
         />
-        <KPICard 
-          title="Total Power Rating" 
-          value={totalPowerRating !== null ? `${totalPowerRating.toLocaleString()} kW` : '--'} 
-          subtitle="Sum of asset ratings"
-          icon={<Activity className="w-5 h-5" />} 
+        <KPICard
+          title={powerRatingTitle}
+          value={powerFormatted.displayValue !== '--' ? `${Number(powerFormatted.displayValue).toLocaleString()} ${powerFormatted.unit}` : '--'}
+          subtitle={powerRatingSubtitle}
+          icon={<Activity className="w-5 h-5" />}
         />
       </div>
 
@@ -121,8 +141,9 @@ export default function SiteDetailsPage() {
               <tr>
                 <th className="px-6 py-4">Asset Name</th>
                 <th className="px-6 py-4">Identifier</th>
+                <th className="px-6 py-4">EMU Serial No.</th>
                 <th className="px-6 py-4">Model</th>
-                <th className="px-6 py-4 text-right">Capacity (kWh)</th>
+                <th className="px-6 py-4 text-right">Capacity ({preferences.energyUnit})</th>
                 <th className="px-6 py-4 text-center">Status</th>
                 <th className="px-6 py-4 text-right">Action</th>
               </tr>
@@ -130,7 +151,7 @@ export default function SiteDetailsPage() {
             <tbody className="divide-y divide-slate-100">
               {assets.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="px-6 py-8 text-center text-slate-500">
+                  <td colSpan={7} className="px-6 py-8 text-center text-slate-500">
                     No BESS assets assigned to this site.
                   </td>
                 </tr>
@@ -144,9 +165,13 @@ export default function SiteDetailsPage() {
                       {asset.name}
                     </td>
                     <td className="px-6 py-4 text-slate-600">{asset.assetIdentifier}</td>
-                    <td className="px-6 py-4 text-slate-600">{(asset as any).model || '--'}</td>
+                    <td className="px-6 py-4 text-slate-600">{asset.emuId || '--'}</td>
+                    <td className="px-6 py-4 text-slate-600">{asset.model || '--'}</td>
                     <td className="px-6 py-4 text-right text-slate-700">
-                      {((asset as any).energyCapacity !== null && (asset as any).energyCapacity !== undefined) ? ((asset as any).energyCapacity).toLocaleString() : '--'}
+                      {(() => {
+                        const formatted = formatEnergy(asset.energyCapacity);
+                        return formatted.displayValue !== '--' ? Number(formatted.displayValue).toLocaleString() : '--';
+                      })()}
                     </td>
                     <td className="px-6 py-4 text-center">
                       <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800">

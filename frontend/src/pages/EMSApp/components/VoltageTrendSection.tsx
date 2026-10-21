@@ -6,12 +6,106 @@ import { ResponsiveContainer, LineChart, CartesianGrid, XAxis, YAxis, Tooltip, L
 import { Loader2, Download } from 'lucide-react';
 import { useParams } from 'react-router-dom';
 import { useLiveTelemetry } from '../../../context/WebSocketContext';
+import { useUserSettings } from '../../../features/settings/hooks/useUserSettings';
+import { formatDateTimeCustom, formatTimeCustom } from '../../../features/settings/settings.utils';
+import type { TimeFormat, DateFormat } from '../../../features/settings/settings.types';
 
-interface VoltageTrendSectionProps {
+export interface VoltageTrendSectionProps {
   assetId: string;
+  timeFormat?: TimeFormat;
+  dateFormat?: DateFormat;
+  timeZone?: string;
 }
 
-export function VoltageTrendSection({ assetId }: VoltageTrendSectionProps) {
+export function formatVoltageTrendTick(
+  timestamp: string | number | Date | null | undefined,
+  timeFormat: TimeFormat = '12h',
+  timeZone?: string
+): string {
+  if (!timestamp) return '';
+  return formatTimeCustom(timestamp, timeFormat, false, timeZone);
+}
+
+export function formatVoltageTrendTooltipTimestamp(
+  timestamp: string | number | Date | null | undefined,
+  dateFormat: DateFormat = 'DD MMM YYYY',
+  timeFormat: TimeFormat = '12h',
+  timeZone?: string
+): string {
+  return formatDateTimeCustom(timestamp, dateFormat, timeFormat, false, timeZone);
+}
+
+interface CustomTooltipProps {
+  active?: boolean;
+  payload?: any[];
+  timeFormat?: TimeFormat;
+  dateFormat?: DateFormat;
+  timeZone?: string;
+}
+
+const CustomTooltip = ({
+  active,
+  payload,
+  timeFormat = '12h',
+  dateFormat = 'DD MMM YYYY',
+  timeZone,
+}: CustomTooltipProps) => {
+  if (active && payload && payload.length) {
+    const dataPoint = payload[0].payload;
+    if (dataPoint.isBreakPoint) return null;
+    const isUnknown = dataPoint.activeSource === 'UNKNOWN';
+    const formattedTimestamp = formatVoltageTrendTooltipTimestamp(
+      dataPoint.timestamp,
+      dateFormat,
+      timeFormat,
+      timeZone
+    );
+    return (
+      <div className="bg-white p-3 border border-slate-200 shadow-md rounded text-sm">
+        <p className="font-semibold mb-2 text-slate-800">{formattedTimestamp}</p>
+        <p className={`font-bold mb-2 ${isUnknown ? 'text-amber-600' : 'text-slate-700'}`}>
+          Source: {dataPoint.activeSource || 'UNKNOWN'}
+          {isUnknown && ' (Unconfirmed)'}
+        </p>
+        {payload.map((entry: any, index: number) => {
+          return (
+            <div key={index} className="mb-1">
+              <p style={{ color: entry.color }}>
+                {entry.name}: {entry.value !== null ? `${entry.value} V` : 'N/A'}
+              </p>
+            </div>
+          );
+        })}
+      </div>
+    );
+  }
+  return null;
+};
+
+const CustomDot = (props: any) => {
+  const { cx, cy, payload, stroke } = props;
+  if (!cx || !cy || payload.isBreakPoint) return null;
+
+  if (payload.isDuplicateTime) {
+    return (
+      <circle cx={cx} cy={cy} r={3} stroke={stroke} strokeWidth={2} fill="#fff" />
+    );
+  }
+  return null;
+};
+
+export function VoltageTrendSection({
+  assetId,
+  timeFormat: propTimeFormat,
+  dateFormat: propDateFormat,
+  timeZone: propTimeZone,
+}: VoltageTrendSectionProps) {
+  const { preferences, resolvedTimezone } = useUserSettings();
+
+  const effectiveTimeFormat = propTimeFormat ?? preferences.timeFormat;
+  const effectiveDateFormat = propDateFormat ?? preferences.dateFormat;
+  const effectiveTimeZone = propTimeZone ?? resolvedTimezone;
+
   const [showGraph, setShowGraph] = useState(false);
   const [selectedDate, setSelectedDate] = useState<string>(new Date().toLocaleDateString('en-CA'));
   const [data, setData] = useState<VoltageTrendPoint[]>([]);
@@ -37,7 +131,60 @@ export function VoltageTrendSection({ assetId }: VoltageTrendSectionProps) {
         const end = new Date(year, month - 1, day + 1, 0, 0, 0, 0);
 
         const result = await dashboardService.getBessVoltageTrend(assetId, start, end);
-        setData(result);
+
+        const filteredResult = result.filter((r: any) => r.activeSource !== 'UNKNOWN');
+
+        const processed: any[] = [];
+        let dataIndex = 0;
+        const FRESHNESS_MS = 6 * 60 * 1000;
+
+        for (let i = 0; i < filteredResult.length; i++) {
+          const currentTs = new Date(filteredResult[i].timestamp).getTime();
+
+          if (i > 0) {
+            const prevTs = new Date(filteredResult[i - 1].timestamp).getTime();
+
+            // Check for gap due to missing data or filtered UNKNOWNs
+            if (currentTs - prevTs > FRESHNESS_MS) {
+              processed.push({
+                index: dataIndex++,
+                timestamp: filteredResult[i].timestamp,
+                isBreakPoint: true,
+                gridVoltageUab: null,
+                gridVoltageUbc: null,
+                gridVoltageUca: null,
+                bessVoltageUa: null,
+                bessVoltageUb: null,
+                bessVoltageUc: null,
+              });
+            }
+
+            // Check for duplicate time with different source (transition)
+            if (currentTs === prevTs && filteredResult[i].activeSource !== filteredResult[i - 1].activeSource) {
+              processed.push({
+                index: dataIndex++,
+                timestamp: filteredResult[i].timestamp,
+                isBreakPoint: true,
+                gridVoltageUab: null,
+                gridVoltageUbc: null,
+                gridVoltageUca: null,
+                bessVoltageUa: null,
+                bessVoltageUb: null,
+                bessVoltageUc: null,
+              });
+            }
+          }
+
+          const isDuplicateTime =
+            (i > 0 && filteredResult[i].timestamp === filteredResult[i - 1].timestamp) ||
+            (i < filteredResult.length - 1 && filteredResult[i].timestamp === filteredResult[i + 1].timestamp);
+
+          processed.push({ ...filteredResult[i], isDuplicateTime, index: dataIndex++ });
+        }
+
+        console.log('API Result:', result);
+        console.log('Processed for Recharts:', processed);
+        setData(processed as VoltageTrendPoint[]);
       } catch (err: any) {
         setError(err.message || 'Failed to load voltage trend');
       } finally {
@@ -69,7 +216,9 @@ export function VoltageTrendSection({ assetId }: VoltageTrendSectionProps) {
     const todayLocal = new Date().toLocaleDateString('en-CA');
     if (selectedDate !== todayLocal) return;
 
-    if (fetchTimeoutRef.current) return; // already queued
+    // Throttle: If a fetch is already queued, do not cancel and reschedule.
+    // This guarantees a fetch happens 3 seconds after the first event in a burst.
+    if (fetchTimeoutRef.current) return;
 
     fetchTimeoutRef.current = window.setTimeout(() => {
       fetchTimeoutRef.current = null;
@@ -78,14 +227,19 @@ export function VoltageTrendSection({ assetId }: VoltageTrendSectionProps) {
       }
     }, 3000); // 3-second coalescing window
 
+    // No return cleanup here for the timeout itself because we want the throttle to persist across renders
+    // caused by rapid telemetry updates. The unmount cleanup is handled separately below.
+  }, [telemetry, showGraph, selectedDate, isConnected]);
+
+  // Cleanup timeout on unmount
+  useEffect(() => {
     return () => {
-      // We only clear on unmount or deps change that would invalidate the need to fetch
       if (fetchTimeoutRef.current) {
         window.clearTimeout(fetchTimeoutRef.current);
         fetchTimeoutRef.current = null;
       }
     };
-  }, [telemetry, showGraph, selectedDate, isConnected]);
+  }, []);
 
   const handleExport = () => {
     const [year, month, day] = selectedDate.split('-').map(Number);
@@ -105,7 +259,7 @@ export function VoltageTrendSection({ assetId }: VoltageTrendSectionProps) {
              const urlBlob = window.URL.createObjectURL(blob);
              a.href = urlBlob;
              const safeDate = start.toISOString().split('T')[0];
-             a.download = `Voltage_Trend_${assetId}_${safeDate}.xlsx`;
+             a.download = `Voltage_Trend_${assetId}_${safeDate}.csv`;
              document.body.appendChild(a);
              a.click();
              window.URL.revokeObjectURL(urlBlob);
@@ -146,7 +300,7 @@ export function VoltageTrendSection({ assetId }: VoltageTrendSectionProps) {
               className="inline-flex items-center px-3 py-1.5 border border-slate-300 shadow-sm text-sm font-medium rounded-md text-slate-700 bg-white hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-500"
             >
               <Download className="w-4 h-4 mr-2" />
-              Export Excel
+              Export CSV
             </button>
           </div>
         )}
@@ -172,28 +326,34 @@ export function VoltageTrendSection({ assetId }: VoltageTrendSectionProps) {
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={data} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
                   <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
-                  <XAxis 
-                    dataKey="timestamp" 
+                  <XAxis
+                    dataKey="index"
+                    padding={{ left: 30, right: 30 }}
                     tickFormatter={(val) => {
-                      const d = new Date(val);
-                      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                      if (!data[val] || !data[val].timestamp) return '';
+                      return formatVoltageTrendTick(data[val].timestamp, effectiveTimeFormat, effectiveTimeZone);
                     }}
                   />
-                  <YAxis 
+                  <YAxis
                     label={{ value: 'Voltage (V)', angle: -90, position: 'insideLeft', offset: -10 }} 
                   />
-                  <Tooltip 
-                    labelFormatter={(val) => new Date(String(val)).toLocaleString()}
-                    formatter={(value, name) => [value, name]}
+                  <Tooltip
+                    content={
+                      <CustomTooltip
+                        timeFormat={effectiveTimeFormat}
+                        dateFormat={effectiveDateFormat}
+                        timeZone={effectiveTimeZone}
+                      />
+                    }
                   />
                   <Legend />
-                  <Line connectNulls={false} type="monotone" dataKey="gridVoltageUab" name="Grid Uab" stroke="#2563eb" dot={false} strokeWidth={2} />
-                  <Line connectNulls={false} type="monotone" dataKey="gridVoltageUbc" name="Grid Ubc" stroke="#3b82f6" dot={false} strokeWidth={2} />
-                  <Line connectNulls={false} type="monotone" dataKey="gridVoltageUca" name="Grid Uca" stroke="#60a5fa" dot={false} strokeWidth={2} />
+                  <Line connectNulls={false} type="monotone" dataKey="gridVoltageUab" name="Grid Uab" stroke="#2563eb" dot={<CustomDot />} strokeWidth={2} />
+                  <Line connectNulls={false} type="monotone" dataKey="gridVoltageUbc" name="Grid Ubc" stroke="#3b82f6" dot={<CustomDot />} strokeWidth={2} />
+                  <Line connectNulls={false} type="monotone" dataKey="gridVoltageUca" name="Grid Uca" stroke="#60a5fa" dot={<CustomDot />} strokeWidth={2} />
                   
-                  <Line connectNulls={false} type="monotone" dataKey="bessVoltageUa" name="BESS Ua" stroke="#16a34a" dot={false} strokeWidth={2} />
-                  <Line connectNulls={false} type="monotone" dataKey="bessVoltageUb" name="BESS Ub" stroke="#22c55e" dot={false} strokeWidth={2} />
-                  <Line connectNulls={false} type="monotone" dataKey="bessVoltageUc" name="BESS Uc" stroke="#4ade80" dot={false} strokeWidth={2} />
+                  <Line connectNulls={false} type="monotone" dataKey="bessVoltageUa" name="BESS Uab" stroke="#16a34a" dot={<CustomDot />} strokeWidth={2} />
+                  <Line connectNulls={false} type="monotone" dataKey="bessVoltageUb" name="BESS Ubc" stroke="#22c55e" dot={<CustomDot />} strokeWidth={2} />
+                  <Line connectNulls={false} type="monotone" dataKey="bessVoltageUc" name="BESS Uca" stroke="#4ade80" dot={<CustomDot />} strokeWidth={2} />
                 </LineChart>
               </ResponsiveContainer>
             </div>

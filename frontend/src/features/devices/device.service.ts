@@ -45,6 +45,7 @@ export const deviceService = {
   updateDevice: async (deviceId: string, payload: UpdateDevicePayload): Promise<Device> => {
     const body: Record<string, unknown> = {};
     if (payload.type !== undefined) body.type = payload.type;
+    if (payload.name !== undefined) body.name = payload.name?.trim() || null;
     if (payload.hardwareId !== undefined) body.hardwareId = payload.hardwareId?.trim() || null;
     if (payload.componentId !== undefined) body.componentId = payload.componentId.trim();
     const response = await authenticatedFetch(`${API_BASE}/api/devices/${deviceId}`, {

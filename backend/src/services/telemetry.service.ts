@@ -1,10 +1,12 @@
 import { prisma } from '../db/prisma';
 import { TelemetryHistory, Device } from '@prisma/client';
 import { LiveTelemetryPayload } from './websocket.service';
-import { normalizePcsState } from './mqtt.service';
+import { normalizePcsState, normalizeComponentSignals } from './mqtt.service';
+import { calculateLineVoltage } from '../utils/pcs-telemetry.util';
 
 export type TelemetryWithDevice = TelemetryHistory & { 
-  device: Device & { bessAsset?: { emuId: string } | null } 
+  device: Device & { bessAsset?: { emuId: string } | null };
+  bessPowerFactorMeasuredAt?: Date | string;
 };
 
 export class TelemetryService {
@@ -47,6 +49,29 @@ export class TelemetryService {
           
           if (validPfRow && validPfRow.powerFactor !== null) {
             row.powerFactor = validPfRow.powerFactor;
+          }
+        }
+
+        // Fallback for intermittently missing PCS BESS Power Factor
+        if (device.componentId === 'pcs') {
+          if (row.bessPowerFactor === null) {
+            const lookbackWindow = new Date(row.timestamp.getTime() - 15 * 60 * 1000);
+            const validPfRow = await prisma.telemetryHistory.findFirst({
+              where: {
+                deviceId: device.id,
+                bessPowerFactor: { not: null },
+                timestamp: { gte: lookbackWindow, lte: row.timestamp }
+              },
+              orderBy: { timestamp: 'desc' },
+              select: { bessPowerFactor: true, timestamp: true }
+            });
+
+            if (validPfRow && validPfRow.bessPowerFactor !== null) {
+              row.bessPowerFactor = validPfRow.bessPowerFactor;
+              (row as any).bessPowerFactorMeasuredAt = validPfRow.timestamp;
+            }
+          } else {
+            (row as any).bessPowerFactorMeasuredAt = row.timestamp;
           }
         }
 
@@ -110,16 +135,25 @@ export class TelemetryService {
       if (row.accumChargeEnergy !== null) wsData.accChargeEnergy = row.accumChargeEnergy;
       if (row.accumDischargeEnergy !== null) wsData.accDischargeEnergy = row.accumDischargeEnergy;
       if (row.bessFrequency !== null) wsData.bessFrequency = row.bessFrequency;
-      if (row.bessPowerFactor !== null) wsData.bessPowerFactor = row.bessPowerFactor;
-      
-      // PCS State relies on di_singco_state from rawPayload, but let's try to extract if we can.
-      // For now, if we don't have di_singco_state extracted as a named column, we might omit it,
-      // or we can parse rawPayload.
-      if (row.rawPayload && Array.isArray(row.rawPayload)) {
-        const sig = (row.rawPayload as any[]).find(s => s && s.m === 'di_singco_state');
-        if (sig && sig.v !== undefined) {
-          wsData.pcsState = normalizePcsState(Number(sig.v));
+      if (row.bessPowerFactor !== null) {
+        wsData.bessPowerFactor = row.bessPowerFactor;
+        if ((row as any).bessPowerFactorMeasuredAt) {
+          const measuredAt = (row as any).bessPowerFactorMeasuredAt;
+          wsData.bessPowerFactorMeasuredAt = measuredAt instanceof Date ? measuredAt.toISOString() : measuredAt;
         }
+      }
+      
+      // PCS State, Temperature, Line Voltage, and AC Current from rawPayload / columns
+      if (row.rawPayload && Array.isArray(row.rawPayload)) {
+        const normalized = normalizeComponentSignals('pcs', row.rawPayload as any[]);
+        if (normalized.wsData.pcsTemperature !== undefined) wsData.pcsTemperature = normalized.wsData.pcsTemperature;
+        if (normalized.wsData.pcsLineVoltage !== undefined) wsData.pcsLineVoltage = normalized.wsData.pcsLineVoltage;
+        if (normalized.wsData.pcsAcCurrent !== undefined) wsData.pcsAcCurrent = normalized.wsData.pcsAcCurrent;
+        if (normalized.wsData.pcsState !== undefined) wsData.pcsState = normalized.wsData.pcsState;
+      }
+      if (wsData.pcsLineVoltage === undefined && row.bessVoltageUa !== null && row.bessVoltageUb !== null && row.bessVoltageUc !== null) {
+        const calcVolt = calculateLineVoltage(row.bessVoltageUa, row.bessVoltageUb, row.bessVoltageUc);
+        if (calcVolt !== undefined) wsData.pcsLineVoltage = calcVolt;
       }
     } else if (comp === 'pmg') {
       if (row.gridSideLoad !== null) wsData.gridPower = row.gridSideLoad;
@@ -140,10 +174,52 @@ export class TelemetryService {
       if (row.cellVMax !== null) wsData.cellVMax = row.cellVMax;
       if (row.cellVMin !== null) wsData.cellVMin = row.cellVMin;
       if (row.cellTempMax !== null) wsData.cellTempMax = row.cellTempMax;
+
+      // Reconstruct missing BMS metrics from rawPayload
+      if (row.rawPayload && Array.isArray(row.rawPayload)) {
+        const normalized = normalizeComponentSignals('bcms', row.rawPayload as any[]);
+        if (wsData.bessSoc === undefined && normalized.wsData.bessSoc !== undefined) wsData.bessSoc = normalized.wsData.bessSoc;
+        if (wsData.bmsSoh === undefined && normalized.wsData.bmsSoh !== undefined) wsData.bmsSoh = normalized.wsData.bmsSoh;
+        if (wsData.bmsCurrent === undefined && normalized.wsData.bmsCurrent !== undefined) wsData.bmsCurrent = normalized.wsData.bmsCurrent;
+        if (wsData.cellVMax === undefined && normalized.wsData.cellVMax !== undefined) wsData.cellVMax = normalized.wsData.cellVMax;
+        if (wsData.cellVMin === undefined && normalized.wsData.cellVMin !== undefined) wsData.cellVMin = normalized.wsData.cellVMin;
+        if (wsData.cellTempMax === undefined && normalized.wsData.cellTempMax !== undefined) wsData.cellTempMax = normalized.wsData.cellTempMax;
+
+        if (normalized.wsData.cellTempMin !== undefined) wsData.cellTempMin = normalized.wsData.cellTempMin;
+        if (normalized.wsData.bmsDcVoltage !== undefined) wsData.bmsDcVoltage = normalized.wsData.bmsDcVoltage;
+        if (normalized.wsData.bmsCabinetState !== undefined) wsData.bmsCabinetState = normalized.wsData.bmsCabinetState;
+      }
     } else if (comp === 'pinv') {
       if (row.solarPower !== null) wsData.solarPower = row.solarPower;
       if (row.solarFrequency !== null) wsData.solarFrequency = row.solarFrequency;
       if (row.solarPowerFactor !== null) wsData.solarPowerFactor = row.solarPowerFactor;
+    } else if (comp === 'th') {
+      if (row.rawPayload && Array.isArray(row.rawPayload)) {
+        const normalized = normalizeComponentSignals('th', row.rawPayload as any[]);
+        if (normalized.wsData.batteryAmbientTemp !== undefined) {
+          wsData.batteryAmbientTemp = normalized.wsData.batteryAmbientTemp;
+        }
+      }
+    } else if (comp === 'tms') {
+      if (row.rawPayload && Array.isArray(row.rawPayload)) {
+        const normalized = normalizeComponentSignals('tms', row.rawPayload as any[]);
+        if (normalized.wsData.tmsAmbientTemp !== undefined) wsData.tmsAmbientTemp = normalized.wsData.tmsAmbientTemp;
+        if (normalized.wsData.tmsOperatingMode !== undefined) wsData.tmsOperatingMode = normalized.wsData.tmsOperatingMode;
+        if (normalized.wsData.tmsCoolantReturnTemp !== undefined) wsData.tmsCoolantReturnTemp = normalized.wsData.tmsCoolantReturnTemp;
+        if (normalized.wsData.tmsCoolantInletTemp !== undefined) wsData.tmsCoolantInletTemp = normalized.wsData.tmsCoolantInletTemp;
+        if (normalized.wsData.tmsCoolantReturnPressure !== undefined) wsData.tmsCoolantReturnPressure = normalized.wsData.tmsCoolantReturnPressure;
+        if (normalized.wsData.tmsCoolantInletPressure !== undefined) wsData.tmsCoolantInletPressure = normalized.wsData.tmsCoolantInletPressure;
+      }
+    } else if (comp.startsWith('pack_')) {
+      if (row.rawPayload && Array.isArray(row.rawPayload)) {
+        const normalized = normalizeComponentSignals(comp, row.rawPayload as any[]);
+        if (normalized.wsData.packAvgTemp !== undefined) {
+          wsData.packAvgTemp = normalized.wsData.packAvgTemp;
+        }
+        if (normalized.wsData.packMaxTemp !== undefined) {
+          wsData.packMaxTemp = normalized.wsData.packMaxTemp;
+        }
+      }
     }
 
     return {

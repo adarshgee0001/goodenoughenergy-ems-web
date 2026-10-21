@@ -158,27 +158,38 @@ async function getDynamicReport(
   bessAssetId?: string,
   limit?: number,
   offset?: number
-): Promise<{ snapshots: TelemetrySnapshotRow[]; total: number; summary?: { chargeDifference: number | null; dischargeDifference: number | null; } }> {
+): Promise<{ snapshots: TelemetrySnapshotRow[]; total: number; intervalMinutes?: number; summary?: { chargeDifference: number | null; dischargeDifference: number | null; } }> {
   let url = `/api/sites/${siteId}/telemetry/dynamic-report?from=${encodeURIComponent(from.toISOString())}&to=${encodeURIComponent(to.toISOString())}&intervalMinutes=${intervalMinutes}`;
   if (bessAssetId) url += `&bessAssetId=${encodeURIComponent(bessAssetId)}`;
   if (limit) url += `&limit=${limit}`;
   if (offset) url += `&offset=${offset}`;
 
-  const data = await apiFetch<{ data: { snapshots: TelemetrySnapshotRow[]; total: number; summary?: { chargeDifference: number | null; dischargeDifference: number | null; } } }>(url);
+  const data = await apiFetch<{ data: { snapshots: TelemetrySnapshotRow[]; total: number; intervalMinutes?: number; summary?: { chargeDifference: number | null; dischargeDifference: number | null; } } }>(url);
   return data.data;
 }
 
 /**
- * Downloads the dynamic telemetry report as an Excel blob.
+ * Downloads the dynamic telemetry report as a Blob (CSV for both single-BESS and multi-BESS).
  * GET /api/sites/:siteId/telemetry/export
  */
 async function exportDynamicReport(
   siteId: string,
   from: Date,
   to: Date,
-  intervalMinutes: number
-): Promise<Blob> {
+  intervalMinutes: number,
+  bessAssetId?: string,
+  options?: { powerUnit?: string; energyUnit?: string }
+): Promise<{ blob: Blob; filename?: string; isXlsx: boolean }> {
   let url = `/api/sites/${siteId}/telemetry/export?from=${encodeURIComponent(from.toISOString())}&to=${encodeURIComponent(to.toISOString())}&intervalMinutes=${intervalMinutes}`;
+  if (bessAssetId) {
+    url += `&bessAssetId=${encodeURIComponent(bessAssetId)}`;
+  }
+  if (options?.powerUnit) {
+    url += `&powerUnit=${encodeURIComponent(options.powerUnit)}`;
+  }
+  if (options?.energyUnit) {
+    url += `&energyUnit=${encodeURIComponent(options.energyUnit)}`;
+  }
 
   const response = await authenticatedFetch(`${API_BASE}${url}`, {
     method: 'GET',
@@ -193,8 +204,18 @@ async function exportDynamicReport(
     } catch(e) {}
     throw new Error(errorMsg);
   }
-  
-  return await response.blob();
+
+  const contentType = response.headers.get('content-type') || '';
+  const contentDisposition = response.headers.get('content-disposition') || '';
+  let filename: string | undefined;
+  const match = contentDisposition.match(/filename="?([^"]+)"?/);
+  if (match && match[1]) {
+    filename = match[1];
+  }
+
+  const isXlsx = contentType.includes('spreadsheetml') || contentType.includes('xlsx') || (filename?.endsWith('.xlsx') ?? false);
+  const blob = await response.blob();
+  return { blob, filename, isXlsx };
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +284,7 @@ async function getBessVoltageTrend(assetId: string, startDate?: Date, endDate?: 
   const params = new URLSearchParams();
   if (startDate) params.append('startDate', startDate.toISOString());
   if (endDate) params.append('endDate', endDate.toISOString());
+  params.append('_t', Date.now().toString());
   
   const queryStr = params.toString();
   const url = `/api/bess/${assetId}/voltage-trend${queryStr ? '?' + queryStr : ''}`;
@@ -275,6 +297,7 @@ async function getBessGridStateTrend(assetId: string, startDate?: Date, endDate?
   const params = new URLSearchParams();
   if (startDate) params.append('startDate', startDate.toISOString());
   if (endDate) params.append('endDate', endDate.toISOString());
+  params.append('_t', Date.now().toString());
   
   const queryStr = params.toString();
   const url = `/api/bess/${assetId}/grid-state-trend${queryStr ? '?' + queryStr : ''}`;

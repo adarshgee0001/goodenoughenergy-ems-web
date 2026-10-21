@@ -1,7 +1,9 @@
 import { API_BASE } from '../utils/apiClient';
-import React, { createContext, useContext, useEffect, useState, type ReactNode, useRef, useMemo } from 'react';
+import React, { createContext, useContext, useEffect, useState, type ReactNode, useRef, useMemo, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { useAuth } from '../hooks/useAuth';
+import { useUserSettings } from '../features/settings/hooks/useUserSettings';
+import { alarmAudioNotifier } from '../features/settings/alarmAudio.utils';
 
 // Live Telemetry Contract — mirrors backend's LiveTelemetryPayload
 // solarPower intentionally absent: pcs.ai_p is BESS power, NOT solar.
@@ -54,10 +56,35 @@ const WebSocketContext = createContext<WebSocketContextProps | undefined>(undefi
 
 export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   const { isAuthenticated } = useAuth();
+  const { preferences } = useUserSettings();
+  const alarmSoundEnabledRef = useRef(preferences.alarmSoundEnabled);
+  const alarmSoundProfileRef = useRef(preferences.alarmSoundProfile);
+  const warningProfileRef = useRef(preferences.warningAlarmSoundProfile);
+  const criticalProfileRef = useRef(preferences.criticalAlarmSoundProfile);
+
+  useEffect(() => {
+    alarmSoundEnabledRef.current = preferences.alarmSoundEnabled;
+    if (!preferences.alarmSoundEnabled) {
+      alarmAudioNotifier.stopPlayback('master-mute');
+    }
+  }, [preferences.alarmSoundEnabled]);
+
+  useEffect(() => {
+    alarmSoundProfileRef.current = preferences.alarmSoundProfile;
+  }, [preferences.alarmSoundProfile]);
+
+  useEffect(() => {
+    warningProfileRef.current = preferences.warningAlarmSoundProfile;
+  }, [preferences.warningAlarmSoundProfile]);
+
+  useEffect(() => {
+    criticalProfileRef.current = preferences.criticalAlarmSoundProfile;
+  }, [preferences.criticalAlarmSoundProfile]);
+
   const [socket, setSocket] = useState<Socket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [liveTelemetry, setLiveTelemetry] = useState<Record<string, LiveTelemetryPayload>>({});
-  const activeSubscriptions = useRef<Set<string>>(new Set());
+  const activeSubscriptions = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     if (!isAuthenticated) return;
@@ -78,8 +105,10 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
       setIsConnected(true);
       
       // Resubscribe to active rooms upon reconnect
-      activeSubscriptions.current.forEach(siteId => {
-        newSocket.emit('subscribe', { siteId });
+      activeSubscriptions.current.forEach((count, siteId) => {
+        if (count > 0) {
+          newSocket.emit('subscribe', { siteId });
+        }
       });
     });
 
@@ -89,14 +118,32 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
     });
 
     newSocket.on('telemetry', (payload: LiveTelemetryPayload) => {
+      if (!payload || !payload.deviceId) return;
+      const key = payload.componentId ? `${payload.deviceId}:${payload.componentId}` : payload.deviceId;
       setLiveTelemetry(prev => ({
         ...prev,
-        [payload.deviceId]: payload
+        [key]: payload
       }));
     });
 
-    newSocket.on('error', (err) => {
+    newSocket.on('alarm', (payload: any) => {
+      if (payload && payload.alarm) {
+        alarmAudioNotifier.handleIncomingAlarm(
+          payload.alarm,
+          alarmSoundEnabledRef.current,
+          {
+            warning: warningProfileRef.current,
+            critical: criticalProfileRef.current ?? alarmSoundProfileRef.current,
+          }
+        );
+      }
+    });
+
+    newSocket.on('error', (err: any) => {
       console.error('[WebSocket] Server Error:', err);
+      if (err?.message === 'Session expired') {
+        window.dispatchEvent(new Event('auth:expired'));
+      }
     });
 
     newSocket.on('connect_error', (err) => {
@@ -115,22 +162,52 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
     };
   }, [isAuthenticated]);
 
-  const subscribeToSite = (siteId: string) => {
-    if (socket && isConnected) {
-      socket.emit('subscribe', { siteId });
-      activeSubscriptions.current.add(siteId);
-    }
-  };
+  const subscribeToSite = useCallback((siteId: string) => {
+    if (!siteId) return;
+    const currentCount = activeSubscriptions.current.get(siteId) || 0;
+    activeSubscriptions.current.set(siteId, currentCount + 1);
 
-  const unsubscribeFromSite = (siteId: string) => {
-    if (socket && isConnected) {
-      socket.emit('unsubscribe', { siteId });
-      activeSubscriptions.current.delete(siteId);
+    if (currentCount === 0 && socket && isConnected) {
+      socket.emit('subscribe', { siteId });
     }
-  };
+  }, [socket, isConnected]);
+
+  const unsubscribeFromSite = useCallback((siteId: string) => {
+    if (!siteId) return;
+    const currentCount = activeSubscriptions.current.get(siteId) || 0;
+    if (currentCount <= 1) {
+      activeSubscriptions.current.delete(siteId);
+      if (socket && isConnected) {
+        socket.emit('unsubscribe', { siteId });
+      }
+      // Cleanly purge live telemetry entries belonging to the unsubscribed site
+      setLiveTelemetry(prev => {
+        let changed = false;
+        const remaining: Record<string, LiveTelemetryPayload> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (v.siteId === siteId) {
+            changed = true;
+          } else {
+            remaining[k] = v;
+          }
+        }
+        return changed ? remaining : prev;
+      });
+    } else {
+      activeSubscriptions.current.set(siteId, currentCount - 1);
+    }
+  }, [socket, isConnected]);
+
+  const providerValue = useMemo(() => ({
+    socket,
+    isConnected,
+    subscribeToSite,
+    unsubscribeFromSite,
+    liveTelemetry,
+  }), [socket, isConnected, subscribeToSite, unsubscribeFromSite, liveTelemetry]);
 
   return (
-    <WebSocketContext.Provider value={{ socket, isConnected, subscribeToSite, unsubscribeFromSite, liveTelemetry }}>
+    <WebSocketContext.Provider value={providerValue}>
       {children}
     </WebSocketContext.Provider>
   );
@@ -155,7 +232,7 @@ export const useLiveTelemetry = (siteId?: string) => {
         unsubscribeFromSite(siteId);
       };
     }
-  }, [siteId, isConnected]);
+  }, [siteId, isConnected, subscribeToSite, unsubscribeFromSite]);
 
   // If siteId is provided, optionally filter telemetry to only that site
   // Memoize to prevent infinite update loops in consumers

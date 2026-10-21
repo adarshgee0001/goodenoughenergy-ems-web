@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import ExcelJS from 'exceljs';
 import app from '../../src/app';
 import { prisma } from '../../src/db/prisma';
 import { sign } from 'jsonwebtoken';
 import http from 'http';
-import ExcelJS from 'exceljs';
 
 import { authService } from '../../src/services/auth.service';
 
@@ -235,122 +235,214 @@ describe('test-report-export.ts', () => {
     });
     expect(resForbidden.status).toBe(403);
 
-    // 3. Authorized request, valid export
+    // 3. Authorized request, valid export for Multi-BESS site (restores Excel workbook)
     const resExport = await fetch(`${baseUrl}/sites/${siteId}/telemetry/export?intervalMinutes=15&from=2026-09-01T00:00:00.000Z&to=2026-09-02T00:00:00.000Z`, {
       headers: { 'Cookie': `auth_token=${clientToken}` }
     });
     expect(resExport.status).toBe(200);
     expect(resExport.headers.get('content-type')).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    
-    const buffer = await resExport.arrayBuffer();
-    
-    // Parse workbook
-    const workbook = new ExcelJS.Workbook();
-    await workbook.xlsx.load(Buffer.from(buffer));
-    
-    // Verify Multi-BESS structure
-    const sheet1 = workbook.getWorksheet('Per-BESS Details');
-    const sheet2 = workbook.getWorksheet('Site Summary');
-    
-    expect(sheet1).toBeDefined();
-    expect(sheet2).toBeDefined();
+    expect(resExport.headers.get('content-disposition')).toContain('.xlsx');
 
-    // Verify Multi-BESS summaries
-    // BESS 01 summary
-    expect(sheet1!.getRow(1).getCell(1).value).toBe('BESS 01');
-    expect(sheet1!.getRow(2).getCell(1).value).toBe('Total Charge Difference');
-    expect(sheet1!.getRow(2).getCell(2).value).toBeCloseTo(18.25); // 1268.75 - 1250.50 (ignores the 1300 middle value)
-    expect(sheet1!.getRow(2).getCell(2).numFmt).toBe('0.00 "kWh"');
-    expect(sheet1!.getRow(3).getCell(1).value).toBe('Total Discharge Difference');
-    expect(sheet1!.getRow(3).getCell(2).value).toBeCloseTo(12.40); // 812.60 - 800.20
-    expect(sheet1!.getRow(3).getCell(2).numFmt).toBe('0.00 "kWh"');
+    const multiExcelBuffer = await resExport.arrayBuffer();
+    const wbMulti = new ExcelJS.Workbook();
+    await wbMulti.xlsx.load(Buffer.from(multiExcelBuffer));
 
-    // BESS 02 summary
-    expect(sheet1!.getRow(5).getCell(1).value).toBe('BESS 02');
-    expect(sheet1!.getRow(6).getCell(1).value).toBe('Total Charge Difference');
-    expect(sheet1!.getRow(6).getCell(2).value).toBeCloseTo(21.50); // 2021.50 - 2000.00
-    expect(sheet1!.getRow(6).getCell(2).numFmt).toBe('0.00 "kWh"');
-    expect(sheet1!.getRow(7).getCell(1).value).toBe('Total Discharge Difference');
-    expect(sheet1!.getRow(7).getCell(2).value).toBeCloseTo(14.75); // 914.75 - 900.00
-    expect(sheet1!.getRow(7).getCell(2).numFmt).toBe('0.00 "kWh"');
+    // Verify worksheets are present: Site Summary and separate sheet for each BESS
+    const sheetNames = wbMulti.worksheets.map((w) => w.name);
+    expect(sheetNames).toEqual(['Site Summary', 'BESS 01', 'BESS 02']);
+    expect(wbMulti.getWorksheet('Per-BESS Details')).toBeUndefined();
 
-    // Verify Table Header is present and intact below summaries
-    const mbHeaderRow = sheet1!.getRow(9);
-    expect(mbHeaderRow.getCell(1).value).toBe('Timestamp');
-    expect(mbHeaderRow.getCell(2).value).toBe('BESS Name');
-    expect(mbHeaderRow.getCell(3).value).toBe('EMU Serial No.');
-    expect(mbHeaderRow.getCell(4).value).toBe('Grid Power (kW)');
-    expect(mbHeaderRow.getCell(20).value).toBe('Accum Charge Energy (kWh)');
-    expect(mbHeaderRow.getCell(26).value).toBe('Grid Frequency (Hz)');
+    const sheetSummary = wbMulti.getWorksheet('Site Summary')!;
+    const sheetBess1 = wbMulti.getWorksheet('BESS 01')!;
+    const sheetBess2 = wbMulti.getWorksheet('BESS 02')!;
+    expect(sheetSummary).toBeDefined();
+    expect(sheetBess1).toBeDefined();
+    expect(sheetBess2).toBeDefined();
 
-    // Verify Data row identities for BESS 01 and 02
-    const mbDataRow1 = sheet1!.getRow(10);
-    expect(mbDataRow1.getCell(2).value).toBe('BESS 01');
-    expect(mbDataRow1.getCell(3).value).toBe('EMU001');
+    // Verify Site Summary metadata & differences (canonical kW / kWh)
+    expect(sheetSummary.getRow(1).getCell(1).value).toBe('EMS Site Summary');
+    expect(sheetSummary.getRow(2).getCell(1).value).toBe('Client Name:');
+    expect(sheetSummary.getRow(2).getCell(2).value).toBe('Export Client');
+    expect(sheetSummary.getRow(3).getCell(2).value).toBe('Export Site');
+    expect(sheetSummary.getRow(8).getCell(1).value).toBe('Total Charge Difference');
+    expect(sheetSummary.getRow(8).getCell(2).value).toBeCloseTo(39.75);
+    expect(sheetSummary.getRow(8).getCell(2).numFmt).toBe('0.00 "kWh"');
+    expect(sheetSummary.getRow(9).getCell(1).value).toBe('Total Discharge Difference');
+    expect(sheetSummary.getRow(9).getCell(2).value).toBeCloseTo(27.15);
+    expect(sheetSummary.getRow(9).getCell(2).numFmt).toBe('0.00 "kWh"');
 
-    const mbDataRow2 = sheet1!.getRow(11); // BESS 02
-    expect(mbDataRow2.getCell(2).value).toBe('BESS 02');
-    expect(mbDataRow2.getCell(3).value).toBe('EMU002');
+    // Verify Site Summary aggregated data (Row 12 immediately beneath header row 11)
+    const summaryRow = sheetSummary.getRow(12);
+    expect(summaryRow.getCell(2).value).toBe(300); // Grid: 100 + 200
+    expect(summaryRow.getCell(3).value).toBe(5); // BESS Power: 15.2 - 10.2
+    expect(summaryRow.getCell(4).value).toBe(120); // Solar: 50 + 70
+    expect(summaryRow.getCell(5).value).toBe(50); // Today Charge: 20 + 30
+    expect(summaryRow.getCell(6).value).toBe(13); // Today Discharge: 5 + 8
+    expect(summaryRow.getCell(7).value).toBe(85); // Avg SOC: (80 + 90) / 2
+    expect(summaryRow.getCell(8).value).toBe(97); // Avg SOH: (98 + 96) / 2
+    // Max PCS Temp removed; cells 9, 10, 11 are Average Frequencies (null when unrecorded)
+    expect(summaryRow.getCell(9).value).toBeNull();
+    expect(summaryRow.getCell(10).value).toBeNull();
+    expect(summaryRow.getCell(11).value).toBeNull();
 
-    // Verify Site Summary differences
-    expect(sheet2!.getRow(1).getCell(1).value).toBe('Total Charge Difference');
-    expect(sheet2!.getRow(1).getCell(2).value).toBeCloseTo(39.75); // 18.25 + 21.50
-    expect(sheet2!.getRow(1).getCell(2).numFmt).toBe('0.00 "kWh"');
-    expect(sheet2!.getRow(2).getCell(1).value).toBe('Total Discharge Difference');
-    expect(sheet2!.getRow(2).getCell(2).value).toBeCloseTo(27.15); // 12.40 + 14.75
-    expect(sheet2!.getRow(2).getCell(2).numFmt).toBe('0.00 "kWh"');
+    // Verify BESS 01 metadata and individual summary (Rows 1-10)
+    expect(sheetBess1.getRow(1).getCell(1).value).toBe('EMS Reports Export (Multi-BESS)');
+    expect(sheetBess1.getRow(2).getCell(2).value).toBe('Export Client');
+    expect(sheetBess1.getRow(3).getCell(2).value).toBe('Export Site');
+    expect(sheetBess1.getRow(8).getCell(1).value).toBe('BESS 01');
+    expect(sheetBess1.getRow(9).getCell(1).value).toBe('Total Charge Difference');
+    expect(sheetBess1.getRow(9).getCell(2).value).toBeCloseTo(18.25);
+    expect(sheetBess1.getRow(9).getCell(2).numFmt).toBe('0.00 "kWh"');
+    expect(sheetBess1.getRow(10).getCell(1).value).toBe('Total Discharge Difference');
+    expect(sheetBess1.getRow(10).getCell(2).value).toBeCloseTo(12.40);
+    expect(sheetBess1.getRow(10).getCell(2).numFmt).toBe('0.00 "kWh"');
 
-    // Verify Site Summary Aggregation (now shifted to row 6 because of 3 prepended rows)
-    const summaryRow = sheet2!.getRow(6);
-    expect(summaryRow.getCell(2).value).toBe(300); // Grid
-    expect(summaryRow.getCell(3).value).toBe(5); // BESS Power (15.2 - 10.2 = 5)
-    expect(summaryRow.getCell(4).value).toBe(120); // Solar Power
-    expect(summaryRow.getCell(5).value).toBe(50); // Today Charge (20+30)
-    expect(summaryRow.getCell(6).value).toBe(13); // Today Discharge (5+8)
-    expect(summaryRow.getCell(7).value).toBe(85); // Avg SOC
-    expect(summaryRow.getCell(8).value).toBe(97); // Avg SOH
-    expect(summaryRow.getCell(9).value).toBe(40); // Max Temp
-    
-    // Check that we have exactly numbers, not strings
-    expect(typeof summaryRow.getCell(3).value).toBe('number');
+    // BESS 01 headers (Row 12)
+    const mbHeaderRow1 = sheetBess1.getRow(12);
+    expect(mbHeaderRow1.getCell(1).value).toBe('Timestamp');
+    expect(mbHeaderRow1.getCell(2).value).toBe('BESS Name');
+    expect(mbHeaderRow1.getCell(3).value).toBe('EMU Serial No.');
+    expect(mbHeaderRow1.getCell(4).value).toBe('Grid Side Load (kW)');
+    expect(mbHeaderRow1.getCell(7).value).toBe('BESS Frequency (Hz)');
+    expect(mbHeaderRow1.getCell(41).value).toBe('Accum Charge Energy (kWh)');
 
-    // 4. Single-BESS Export
+    // BESS 01 data rows (Rows 13+) - contain strictly and only BESS 01
+    let bess1RowCount = 0;
+    sheetBess1.eachRow((row, rowNumber) => {
+      if (rowNumber > 12) {
+        bess1RowCount++;
+        expect(row.getCell(2).value).toBe('BESS 01');
+        expect(row.getCell(3).value).toBe('EMU001');
+      }
+    });
+    expect(bess1RowCount).toBeGreaterThan(0);
+
+    // Verify BESS 02 metadata and individual summary (Rows 1-10)
+    expect(sheetBess2.getRow(1).getCell(1).value).toBe('EMS Reports Export (Multi-BESS)');
+    expect(sheetBess2.getRow(2).getCell(2).value).toBe('Export Client');
+    expect(sheetBess2.getRow(3).getCell(2).value).toBe('Export Site');
+    expect(sheetBess2.getRow(8).getCell(1).value).toBe('BESS 02');
+    expect(sheetBess2.getRow(9).getCell(1).value).toBe('Total Charge Difference');
+    expect(sheetBess2.getRow(9).getCell(2).value).toBeCloseTo(21.50);
+    expect(sheetBess2.getRow(9).getCell(2).numFmt).toBe('0.00 "kWh"');
+    expect(sheetBess2.getRow(10).getCell(1).value).toBe('Total Discharge Difference');
+    expect(sheetBess2.getRow(10).getCell(2).value).toBeCloseTo(14.75);
+    expect(sheetBess2.getRow(10).getCell(2).numFmt).toBe('0.00 "kWh"');
+
+    // BESS 02 headers (Row 12)
+    const mbHeaderRow2 = sheetBess2.getRow(12);
+    expect(mbHeaderRow2.getCell(1).value).toBe('Timestamp');
+    expect(mbHeaderRow2.getCell(2).value).toBe('BESS Name');
+    expect(mbHeaderRow2.getCell(3).value).toBe('EMU Serial No.');
+
+    // BESS 02 data rows (Rows 13+) - contain strictly and only BESS 02
+    let bess2RowCount = 0;
+    sheetBess2.eachRow((row, rowNumber) => {
+      if (rowNumber > 12) {
+        bess2RowCount++;
+        expect(row.getCell(2).value).toBe('BESS 02');
+        expect(row.getCell(3).value).toBe('EMU002');
+      }
+    });
+    expect(bess2RowCount).toBeGreaterThan(0);
+
+    // 4. Single-BESS Export remains CSV with authoritative 29 columns
     const resSingleExport = await fetch(`${baseUrl}/sites/${singleSite.id}/telemetry/export?intervalMinutes=15&from=2026-09-01T00:00:00.000Z&to=2026-09-02T00:00:00.000Z`, {
       headers: { 'Cookie': `auth_token=${clientToken}` }
     });
     expect(resSingleExport.status).toBe(200);
+    expect(resSingleExport.headers.get('content-type')).toBe('text/csv; charset=utf-8');
+    expect(resSingleExport.headers.get('content-disposition')).toContain('.csv');
     
-    const bufferSingle = await resSingleExport.arrayBuffer();
-    const wbSingle = new ExcelJS.Workbook();
-    await wbSingle.xlsx.load(Buffer.from(bufferSingle));
-    
-    const singleSheet = wbSingle.getWorksheet('Telemetry Report');
-    expect(singleSheet).toBeDefined();
-    
-    const chargeDiffRow = singleSheet!.getRow(1);
-    expect(chargeDiffRow.getCell(1).value).toBe('Total Charge Difference');
-    expect(chargeDiffRow.getCell(2).value).toBeCloseTo(18.25);
-    expect(chargeDiffRow.getCell(2).numFmt).toBe('0.00 "kWh"');
-    
-    const dischargeDiffRow = singleSheet!.getRow(2);
-    expect(dischargeDiffRow.getCell(1).value).toBe('Total Discharge Difference');
-    expect(dischargeDiffRow.getCell(2).value).toBeCloseTo(12.40);
-    expect(dischargeDiffRow.getCell(2).numFmt).toBe('0.00 "kWh"');
-    
-    const headerRow = singleSheet!.getRow(4);
-    expect(headerRow.getCell(1).value).toBe('Timestamp');
-    expect(headerRow.getCell(2).value).toBe('BESS Name');
-    expect(headerRow.getCell(3).value).toBe('EMU Serial No.');
-    expect(headerRow.getCell(4).value).toBe('Grid Power (kW)');
-    expect(headerRow.getCell(14).value).toBe('Voltage B (V)');
-    expect(headerRow.getCell(19).value).toBe('Total Power (kW)');
-    expect(headerRow.getCell(20).value).toBe('Accum Charge Energy (kWh)');
-    expect(headerRow.getCell(25).value).toBe('Cell Temp Max (°C)');
-    expect(headerRow.getCell(26).value).toBe('Grid Frequency (Hz)');
-    
-    const dataRow = singleSheet!.getRow(5);
-    expect(dataRow.getCell(2).value).toBe('Single BESS');
-    expect(dataRow.getCell(3).value).toBe('EMU-SINGLE');
-    expect(dataRow.getCell(20).value).toBe(1268.75); // the later record is on top
+    const singleCsvBuffer = Buffer.from(await resSingleExport.arrayBuffer());
+    expect(singleCsvBuffer[0]).toBe(0xEF);
+    expect(singleCsvBuffer[1]).toBe(0xBB);
+    expect(singleCsvBuffer[2]).toBe(0xBF);
+    const singleCsvContent = singleCsvBuffer.toString('utf8');
+
+    expect(singleCsvContent).toContain('EMS Reports Export');
+    expect(singleCsvContent).toContain('Total Charge Difference (kWh),18.25');
+    expect(singleCsvContent).toContain('Total Discharge Difference (kWh),12.4');
+
+    expect(singleCsvContent).toContain('Timestamp,BESS Name,EMU Serial No.,Grid Side Load (kW)');
+    expect(singleCsvContent).not.toContain('Cabinet Meter Power (kW)');
+    expect(singleCsvContent).toContain('Accum Charge Energy (kWh)');
+    expect(singleCsvContent).toContain('Cell Temp Max (°C)');
+    expect(singleCsvContent).toContain('Grid Frequency (Hz)');
+
+    expect(singleCsvContent).toContain('Single BESS,EMU-SINGLE');
+    expect(singleCsvContent).toContain('1268.75');
+
+    // 5. Multi-BESS Export with Unit Preferences (MW and MWh)
+    const resExportMw = await fetch(`${baseUrl}/sites/${siteId}/telemetry/export?intervalMinutes=15&from=2026-09-01T00:00:00.000Z&to=2026-09-02T00:00:00.000Z&powerUnit=MW&energyUnit=MWh`, {
+      headers: { 'Cookie': `auth_token=${clientToken}` }
+    });
+    expect(resExportMw.status).toBe(200);
+    const mwBuffer = await resExportMw.arrayBuffer();
+    const wbMw = new ExcelJS.Workbook();
+    await wbMw.xlsx.load(Buffer.from(mwBuffer));
+
+    const sheetSummaryMw = wbMw.getWorksheet('Site Summary')!;
+    const sheetBess1Mw = wbMw.getWorksheet('BESS 01')!;
+    expect(wbMw.getWorksheet('Per-BESS Details')).toBeUndefined();
+
+    // Differences converted to MWh (divided by 1000)
+    expect(sheetSummaryMw.getRow(8).getCell(2).value).toBeCloseTo(0.04);
+    expect(sheetSummaryMw.getRow(8).getCell(2).numFmt).toBe('0.00 "MWh"');
+    expect(sheetSummaryMw.getRow(9).getCell(2).value).toBeCloseTo(0.03);
+    expect(sheetSummaryMw.getRow(9).getCell(2).numFmt).toBe('0.00 "MWh"');
+
+    // Headers converted to MW and MWh in Site Summary (Row 11 & 12)
+    expect(sheetSummaryMw.getRow(11).getCell(2).value).toBe('Grid Power (MW)');
+    expect(sheetSummaryMw.getRow(11).getCell(3).value).toBe('Total BESS Power (MW)');
+    expect(sheetSummaryMw.getRow(11).getCell(4).value).toBe('Solar Power (MW)');
+    expect(sheetSummaryMw.getRow(11).getCell(5).value).toBe('Total Today Charge (MWh)');
+    expect(sheetSummaryMw.getRow(11).getCell(6).value).toBe('Total Today Discharge (MWh)');
+    expect(sheetSummaryMw.getRow(11).getCell(9).value).toBe('Average Grid Frequency (Hz)');
+    expect(sheetSummaryMw.getRow(11).getCell(10).value).toBe('Average BESS Frequency (Hz)');
+    expect(sheetSummaryMw.getRow(11).getCell(11).value).toBe('Average Solar Frequency (Hz)');
+
+    // Summary data converted in Site Summary (Row 12)
+    const summaryRowMw = sheetSummaryMw.getRow(12);
+    expect(summaryRowMw.getCell(2).value).toBe(0.3); // 300 kW -> 0.3 MW
+    expect(summaryRowMw.getCell(3).value).toBe(0.01); // 5 kW -> 0.005 -> round2(0.01) MW
+    expect(summaryRowMw.getCell(4).value).toBe(0.12); // 120 kW -> 0.12 MW
+    expect(summaryRowMw.getCell(5).value).toBe(0.05); // 50 kWh -> 0.05 MWh
+    expect(summaryRowMw.getCell(6).value).toBe(0.01); // 13 kWh -> 0.013 -> round2(0.01) MWh
+    expect(summaryRowMw.getCell(7).value).toBe(85); // Non-power/energy unchanged: SOC 85%
+    expect(summaryRowMw.getCell(8).value).toBe(97); // SOH 97%
+    // Frequency averages null when no readings present
+    expect(summaryRowMw.getCell(9).value).toBeNull();
+    expect(summaryRowMw.getCell(10).value).toBeNull();
+    expect(summaryRowMw.getCell(11).value).toBeNull();
+
+    // BESS 01 headers converted in Row 12
+    const mbHeaderMw = sheetBess1Mw.getRow(12);
+    expect(mbHeaderMw.getCell(4).value).toBe('Grid Side Load (MW)');
+    expect(mbHeaderMw.getCell(7).value).toBe('BESS Frequency (Hz)');
+    expect(mbHeaderMw.getCell(9).value).toBe('PCS Active Power (MW)');
+    expect(mbHeaderMw.getCell(39).value).toBe('Today Charge Energy (MWh)');
+    expect(mbHeaderMw.getCell(41).value).toBe('Accum Charge Energy (MWh)');
+    expect(mbHeaderMw.getCell(43).value).toBe('Solar Power (MW)');
+    // Non-power/energy headers preserved
+    expect(mbHeaderMw.getCell(5).value).toBe('Grid Frequency (Hz)');
+    expect(mbHeaderMw.getCell(10).value).toBe('PCS Temperature (°C)');
+    expect(mbHeaderMw.getCell(19).value).toBe('SOC (%)');
+
+    // 6. Single-BESS Export with Unit Preferences (MW and MWh)
+    const resSingleMw = await fetch(`${baseUrl}/sites/${singleSite.id}/telemetry/export?intervalMinutes=15&from=2026-09-01T00:00:00.000Z&to=2026-09-02T00:00:00.000Z&powerUnit=MW&energyUnit=MWh`, {
+      headers: { 'Cookie': `auth_token=${clientToken}` }
+    });
+    expect(resSingleMw.status).toBe(200);
+    const singleMwContent = (Buffer.from(await resSingleMw.arrayBuffer())).toString('utf8');
+    expect(singleMwContent).toContain('Total Charge Difference (MWh),0.02');
+    expect(singleMwContent).toContain('Total Discharge Difference (MWh),0.01');
+    expect(singleMwContent).toContain('Grid Side Load (MW)');
+    expect(singleMwContent).toContain('Accum Charge Energy (MWh)');
+    expect(singleMwContent).toContain('Solar Power (MW)');
+    // Non-power/energy headers preserved
+    expect(singleMwContent).toContain('Grid Frequency (Hz)');
+    expect(singleMwContent).toContain('DC Voltage (V)');
+    expect(singleMwContent).toContain('Cell Temp Max (°C)');
   });
 });

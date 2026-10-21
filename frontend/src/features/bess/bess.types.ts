@@ -7,6 +7,7 @@ export interface BessAsset {
   model?: string;
   energyCapacity?: number;
   powerRating?: number;
+  reportIntervalMinutes?: number;
   createdAt: string;
   updatedAt: string;
   siteId: string;

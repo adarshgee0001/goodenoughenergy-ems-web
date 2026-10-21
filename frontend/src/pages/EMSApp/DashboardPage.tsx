@@ -12,15 +12,23 @@
  * Solar PV: solarPower wired from pinv component (Step 1).
  */
 
-import { useState, useEffect } from 'react';
-import { Zap, BatteryMedium, ShieldCheck, AlertCircle, Wifi, WifiOff, RefreshCw, Thermometer, Bolt, Sun, Activity } from 'lucide-react';
+import { useState, useEffect, useRef, useMemo } from 'react';
+import { Zap, BatteryMedium, ShieldCheck, AlertCircle, AlertTriangle, Clock, Wifi, WifiOff, RefreshCw, Bolt, Sun, Activity } from 'lucide-react';
 import { AdvancedKPICard } from './components/AdvancedKPICard';
+import { BessViewSelector } from './components/BessViewSelector';
 import { EnergyFlowDiagram } from './components/EnergyFlowDiagram';
 import { PowerTrendChart } from './components/PowerTrendChart';
 import { BessChargeDischargeChart } from './components/BessChargeDischargeChart';
-import { useLiveTelemetry } from '../../context/WebSocketContext';
+import { BatteryStatusSection } from './components/BatteryStatusSection';
+import { CabinetStateIndicator } from './components/CabinetStateIndicator';
+import { PcsTelemetryTable } from './components/PcsTelemetryTable';
+import { BmsTelemetryTable } from './components/BmsTelemetryTable';
+import { TmsTelemetryTable } from './components/TmsTelemetryTable';
+import { useLiveTelemetry, useWebSocket } from '../../context/WebSocketContext';
 import { useAuth } from '../../hooks/useAuth';
 import { usePreview } from '../../context/PreviewContext';
+import { useUserSettings } from '../../features/settings/hooks/useUserSettings';
+import { alarmAudioNotifier } from '../../features/settings/alarmAudio.utils';
 import {
   dashboardService,
   ClientAccessError,
@@ -32,278 +40,25 @@ import type { RealAlarm } from '../../features/alarms/alarm.service';
 import type {
   DashboardContext,
   DashboardTelemetryState,
-  LatestTelemetryRow,
   PowerTrendPoint,
-  DashboardDevice,
+  HistoricalTelemetryRow,
 } from '../../features/dashboard/dashboard.types';
-import { consolidatePowerTrendData } from '../../features/dashboard/dashboard.utils';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Freshness threshold in milliseconds (5 minutes) */
-const STALE_THRESHOLD_MS = 5 * 60 * 1000;
-
-function formatValue(v: number | undefined | null, decimals = 1): string {
-  return v !== undefined && v !== null ? v.toFixed(decimals) : '--';
-}
-
-/**
- * Converts a LatestTelemetryRow array (REST snapshot) into a
- * DashboardTelemetryState by picking named columns by componentId.
- * No mock fallbacks — missing fields remain undefined.
- */
-function buildStateFromRest(rows: LatestTelemetryRow[], devices: DashboardDevice[]): Record<string, DashboardTelemetryState> {
-  const state: Record<string, DashboardTelemetryState> = {};
-
-  // Find all unique BESS asset IDs from the context devices
-  const bessAssetIds = new Set(devices.map(d => d.bessAssetId).filter(Boolean));
-
-  for (const bessId of bessAssetIds) {
-    const bessDevices = devices.filter(d => d.bessAssetId === bessId);
-    const bessRows = rows.filter(r => bessDevices.some(d => d.id === r.deviceId));
-
-    const pcs = bessRows.find(r => r.device.componentId === 'pcs');
-    const pmg = bessRows.find(r => r.device.componentId === 'pmg');
-    const rjl = bessRows.find(r => r.device.componentId === 'rjl');
-    const bcms = bessRows.find(r => r.device.componentId === 'bcms');
-    const pinv = bessRows.find(r => r.device.componentId === 'pinv');
-
-    const timestamps = bessRows.map(r => r.timestamp).filter(Boolean);
-    const latestTimestamp = timestamps.length > 0
-      ? timestamps.reduce((a, b) => (a > b ? a : b))
-      : undefined;
-
-    state[bessId as string] = {
-      timestamp: latestTimestamp,
-      pcsTimestamp: pcs?.timestamp,
-      pmgTimestamp: pmg?.timestamp,
-      pinvTimestamp: pinv?.timestamp,
-      bcmsTimestamp: bcms?.timestamp,
-      rjlTimestamp: rjl?.timestamp,
-    // PCS
-    bessPower: pcs?.pcsActivePower ?? undefined,
-    // Source: pcs.ai_freq → BESS Frequency
-    bessFrequency: pcs?.bessFrequency ?? undefined,
-    bessPowerFactor: pcs?.bessPowerFactor ?? undefined,
-    pcsDcVoltage: pcs?.dcVoltage ?? undefined,
-    pcsTemp: pcs?.ambientTemp ?? undefined,
-    todayChargeEnergy: pcs?.todayChargeEnergy ?? undefined,
-    todayDischargeEnergy: pcs?.todayDischargeEnergy ?? undefined,
-    accChargeEnergy: pcs?.accumChargeEnergy ?? undefined,
-    accDischargeEnergy: pcs?.accumDischargeEnergy ?? undefined,
-    // Grid Meter
-    gridPower: pmg?.gridSideLoad ?? undefined,
-    gridFrequency: pmg?.gridFrequency ?? undefined,
-    powerFactor: pmg?.powerFactor ?? undefined,
-    // Cabinet Meter
-    voltageA: (rjl?.voltageA ?? pmg?.voltageA) ?? undefined,
-    voltageB: rjl?.voltageB ?? undefined,
-    voltageC: rjl?.voltageC ?? undefined,
-    currentA: rjl?.currentA ?? undefined,
-    currentB: rjl?.currentB ?? undefined,
-    currentC: rjl?.currentC ?? undefined,
-    totalPower: rjl?.totalPower ?? undefined,
-    // BMS — populated from bcms
-    bessSoc: bcms?.soc ?? undefined,
-    bmsSoh: bcms?.soh ?? undefined,
-    bmsCurrent: undefined,
-    cellVMax: undefined,
-    cellVMin: undefined,
-    cellTempMax: undefined,
-    // Solar PV Inverter (pinv — Step 1)
-    solarPower: pinv?.solarPower ?? undefined,
-    solarFrequency: pinv?.solarFrequency ?? undefined,
-    solarPowerFactor: pinv?.solarPowerFactor ?? undefined,
-    };
-  }
-
-  return state;
-}
-
-/**
- * Merges a single WS LiveTelemetryPayload (keyed by componentId) into the
- * current telemetry state. Only the relevant fields for each component are
- * updated — other components' fields are preserved.
- */
-function mergeWsPayload(
-  prev: DashboardTelemetryState,
-  componentId: string,
-  data: Record<string, number | string | undefined>,
-  timestamp: string
-): DashboardTelemetryState {
-  let newTimestamp = timestamp;
-  if (prev.timestamp && new Date(prev.timestamp).getTime() > new Date(timestamp).getTime()) {
-    newTimestamp = prev.timestamp;
-  }
-  const next = { ...prev, timestamp: newTimestamp };
-
-  if (componentId === 'pcs') {
-    let newTimestamp = timestamp;
-    if (prev.pcsTimestamp && new Date(prev.pcsTimestamp).getTime() > new Date(timestamp).getTime()) {
-      newTimestamp = prev.pcsTimestamp;
-    }
-    next.pcsTimestamp = newTimestamp;
-
-    if (data.bessPower !== undefined) next.bessPower = data.bessPower as number;
-    if (data.bessFrequency !== undefined) next.bessFrequency = data.bessFrequency as number;
-    if (data.bessPowerFactor !== undefined) next.bessPowerFactor = data.bessPowerFactor as number;
-    if (data.pcsState !== undefined) next.pcsState = data.pcsState as string;
-    if (data.pcsDcVoltage !== undefined) next.pcsDcVoltage = data.pcsDcVoltage as number;
-    if (data.pcsTemp !== undefined) next.pcsTemp = data.pcsTemp as number;
-    if (data.todayChargeEnergy !== undefined) next.todayChargeEnergy = data.todayChargeEnergy as number;
-    if (data.todayDischargeEnergy !== undefined) next.todayDischargeEnergy = data.todayDischargeEnergy as number;
-    if (data.accChargeEnergy !== undefined) next.accChargeEnergy = data.accChargeEnergy as number;
-    if (data.accDischargeEnergy !== undefined) next.accDischargeEnergy = data.accDischargeEnergy as number;
-    return next;
-  }
-
-  if (componentId === 'pmg') {
-    let newTimestamp = timestamp;
-    if (prev.pmgTimestamp && new Date(prev.pmgTimestamp).getTime() > new Date(timestamp).getTime()) {
-      newTimestamp = prev.pmgTimestamp;
-    }
-    next.pmgTimestamp = newTimestamp;
-
-    if (data.gridPower !== undefined) next.gridPower = data.gridPower as number;
-    if (data.gridPhaseAVoltage !== undefined && next.voltageA === undefined) {
-      next.voltageA = data.gridPhaseAVoltage as number;
-    }
-    if (data.gridFrequency !== undefined) next.gridFrequency = data.gridFrequency as number;
-    if (data.powerFactor !== undefined) next.powerFactor = data.powerFactor as number;
-    return next;
-  }
-
-  if (componentId === 'rjl' || componentId === 'jl') {
-    let newTimestamp = timestamp;
-    if (prev.rjlTimestamp && new Date(prev.rjlTimestamp).getTime() > new Date(timestamp).getTime()) {
-      newTimestamp = prev.rjlTimestamp;
-    }
-    next.rjlTimestamp = newTimestamp;
-
-    if (data.phaseAVoltage !== undefined) next.voltageA = data.phaseAVoltage as number;
-    if (data.phaseBVoltage !== undefined) next.voltageB = data.phaseBVoltage as number;
-    if (data.phaseCVoltage !== undefined) next.voltageC = data.phaseCVoltage as number;
-    if (data.phaseACurrent !== undefined) next.currentA = data.phaseACurrent as number;
-    if (data.phaseBCurrent !== undefined) next.currentB = data.phaseBCurrent as number;
-    if (data.phaseCCurrent !== undefined) next.currentC = data.phaseCCurrent as number;
-    return next;
-  }
-
-  if (componentId === 'bcms') {
-    let newTimestamp = timestamp;
-    if (prev.bcmsTimestamp && new Date(prev.bcmsTimestamp).getTime() > new Date(timestamp).getTime()) {
-      newTimestamp = prev.bcmsTimestamp;
-    }
-    next.bcmsTimestamp = newTimestamp;
-
-    if (data.bessSoc !== undefined) next.bessSoc = data.bessSoc as number;
-    if (data.bmsSoh !== undefined) next.bmsSoh = data.bmsSoh as number;
-    return next;
-  }
-
-  if (componentId === 'pinv') {
-    let newTimestamp = timestamp;
-    if (prev.pinvTimestamp && new Date(prev.pinvTimestamp).getTime() > new Date(timestamp).getTime()) {
-      newTimestamp = prev.pinvTimestamp;
-    }
-    next.pinvTimestamp = newTimestamp;
-
-    // Solar PV Inverter — Step 1
-    if (data.solarPower !== undefined) next.solarPower = data.solarPower as number;
-    if (data.solarFrequency !== undefined) next.solarFrequency = data.solarFrequency as number;
-    if (data.solarPowerFactor !== undefined) next.solarPowerFactor = data.solarPowerFactor as number;
-    return next;
-  }
-
-  // tms, io, and other components: no named-column merge; rawPayload preserved in DB only
-  return next;
-}
-
-// ---------------------------------------------------------------------------
-// Site-Level Aggregation
-// ---------------------------------------------------------------------------
-function aggregateSiteTelemetry(
-  state: Record<string, DashboardTelemetryState>
-): DashboardTelemetryState {
-  const bessStates = Object.values(state);
-  
-  if (bessStates.length === 0) return {};
-
-  const agg: DashboardTelemetryState = {};
-
-  // Helper to safely sum values
-  const sum = (key: keyof DashboardTelemetryState) => {
-    const values = bessStates.map(s => s[key]).filter(v => v !== undefined) as number[];
-    return values.length > 0 ? values.reduce((a, b) => a + b, 0) : undefined;
-  };
-
-  // Helper to safely average values
-  const avg = (key: keyof DashboardTelemetryState) => {
-    const values = bessStates.map(s => s[key]).filter(v => v !== undefined) as number[];
-    return values.length > 0 ? values.reduce((a, b) => a + b, 0) / values.length : undefined;
-  };
-
-  // Helper to safely get max
-  const max = (key: keyof DashboardTelemetryState) => {
-    const values = bessStates.map(s => s[key]).filter(v => v !== undefined) as number[];
-    return values.length > 0 ? Math.max(...values) : undefined;
-  };
-
-  // Helper to safely get min
-  const min = (key: keyof DashboardTelemetryState) => {
-    const values = bessStates.map(s => s[key]).filter(v => v !== undefined) as number[];
-    return values.length > 0 ? Math.min(...values) : undefined;
-  };
-
-  // Timestamp (most recent)
-  const timestamps = bessStates.map(s => s.timestamp).filter(Boolean) as string[];
-  if (timestamps.length > 0) {
-    agg.timestamp = timestamps.reduce((a, b) => (a > b ? a : b));
-  }
-
-  const pcsTimestamps = bessStates.map(s => s.pcsTimestamp).filter(Boolean) as string[];
-  if (pcsTimestamps.length > 0) agg.pcsTimestamp = pcsTimestamps.reduce((a, b) => (a > b ? a : b));
-
-  const pmgTimestamps = bessStates.map(s => s.pmgTimestamp).filter(Boolean) as string[];
-  if (pmgTimestamps.length > 0) agg.pmgTimestamp = pmgTimestamps.reduce((a, b) => (a > b ? a : b));
-
-  const pinvTimestamps = bessStates.map(s => s.pinvTimestamp).filter(Boolean) as string[];
-  if (pinvTimestamps.length > 0) agg.pinvTimestamp = pinvTimestamps.reduce((a, b) => (a > b ? a : b));
-
-  const bcmsTimestamps = bessStates.map(s => s.bcmsTimestamp).filter(Boolean) as string[];
-  if (bcmsTimestamps.length > 0) agg.bcmsTimestamp = bcmsTimestamps.reduce((a, b) => (a > b ? a : b));
-
-  const rjlTimestamps = bessStates.map(s => s.rjlTimestamp).filter(Boolean) as string[];
-  if (rjlTimestamps.length > 0) agg.rjlTimestamp = rjlTimestamps.reduce((a, b) => (a > b ? a : b));
-
-  // SUM metrics (Additive)
-  agg.bessPower = sum('bessPower');
-  agg.gridPower = sum('gridPower'); // Assuming grid power is additive or identical across BESS in same site? Usually just one grid meter for the site, but we sum if multiple reported. Wait, grid is usually a single PMG per site, but if multiple, sum them.
-  agg.todayChargeEnergy = sum('todayChargeEnergy');
-  agg.todayDischargeEnergy = sum('todayDischargeEnergy');
-  agg.accChargeEnergy = sum('accChargeEnergy');
-  agg.accDischargeEnergy = sum('accDischargeEnergy');
-  // Solar PV — sum across independent PV inverters (one per BESS asset)
-  agg.solarPower = sum('solarPower');
-
-  // AVERAGE metrics
-  // Note: SOC is using simple arithmetic average as explicit fallback because BESS capacities are optional and not guaranteed to be reliable for weighting.
-  agg.bessSoc = avg('bessSoc');
-  agg.bmsSoh = avg('bmsSoh');
-
-  // MAX / MIN metrics (Safety extremes)
-  agg.cellTempMax = max('cellTempMax');
-  agg.cellVMax = max('cellVMax');
-  agg.pcsTemp = max('pcsTemp');
-  agg.cellVMin = min('cellVMin');
-
-  // Non-Aggregatable Metrics are left undefined at the site level to avoid mathematically invalid totals.
-  // agg.pcsDcVoltage, agg.voltageA, etc. are NOT aggregated.
-
-  return agg;
-}
+import {
+  consolidatePowerTrendData,
+  resolveLivePoint,
+  type LiveTrendBucket,
+} from '../../features/dashboard/dashboard.utils';
+import {
+  evaluateSignalFreshness,
+  mergeWsPayload,
+  buildStateFromRest,
+  reconcileRestWithLive,
+  aggregateSiteTelemetrySafe,
+  evaluateOverallTelemetryStatus,
+  isValidNumber,
+  parseValidTimestamp,
+  type SubsystemFreshnessInput,
+} from '../../features/dashboard/freshness.utils';
 
 // ---------------------------------------------------------------------------
 // Empty / Error state sub-components
@@ -361,18 +116,54 @@ function LoadingState() {
 export default function DashboardPage() {
   const { role } = useAuth();
   const { isPreviewing, previewClientId } = usePreview();
+  const { preferences, formatPower, formatEnergy, resolvedTimezone, setActiveSiteTimezone, setActiveClientId } = useUserSettings();
 
   // Context resolution state
   const [ctx, setCtx] = useState<DashboardContext | null>(null);
   const [ctxLoading, setCtxLoading] = useState(true);
   const [ctxError, setCtxError] = useState<{ type: 'empty' | 'error'; message: string } | null>(null);
 
+  // Synchronize active site timezone and client context with UserSettingsContext
+  useEffect(() => {
+    if (ctx?.site?.timezone) {
+      setActiveSiteTimezone(ctx.site.timezone);
+    }
+    if (ctx?.client?.id && setActiveClientId) {
+      setActiveClientId(ctx.client.id);
+    }
+  }, [ctx?.site?.timezone, ctx?.client?.id, setActiveSiteTimezone, setActiveClientId]);
+
+  // Active site tracking for clean entity isolation and preventing cross-client data leaks
+  const activeSiteIdRef = useRef<string | null>(null);
+
   // Telemetry state — REST snapshot merged with WS live updates
   const [telemetryState, setTelemetryState] = useState<Record<string, DashboardTelemetryState>>({});
-  const [telemetryLoading, setTelemetryLoading] = useState(false);
-  const [historicalData, setHistoricalData] = useState<PowerTrendPoint[]>([]);
+  const [isInitialTelemetryLoading, setIsInitialTelemetryLoading] = useState(true);
+  const [isTelemetryRefreshing, setIsTelemetryRefreshing] = useState(false);
+  const [rawHistoricalRows, setRawHistoricalRows] = useState<HistoricalTelemetryRow[]>([]);
+  const [liveBuckets, setLiveBuckets] = useState<LiveTrendBucket[]>([]);
   const [chartEndTime, setChartEndTime] = useState<number>(Date.now());
   const [retryCounter, setRetryCounter] = useState(0);
+
+  // Periodic 30-second clock tick to drive signal freshness transitions monotonically
+  // even when no new WebSocket packets arrive. Cleaned up on unmount.
+  const [clockTick, setClockTick] = useState<number>(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setClockTick(Date.now());
+    }, 30_000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // ---------------------------------------------------------------------------
+  // BESS view selector — null means "All BESS — Site Overview" (default)
+  // ---------------------------------------------------------------------------
+  const [selectedBessId, setSelectedBessId] = useState<string | null>(null);
+
+  // Reset to All BESS whenever the active site changes (e.g. admin preview switch)
+  useEffect(() => {
+    setSelectedBessId(null);
+  }, [ctx?.site.id]);
 
   // Alarms state
   const [alarms, setAlarms] = useState<RealAlarm[]>([]);
@@ -421,22 +212,52 @@ export default function DashboardPage() {
   useEffect(() => {
     if (!ctx) return;
     let cancelled = false;
+    const targetSiteId = ctx.site.id;
+
+    // Check if we switched to a different site (e.g. changing client preview)
+    const isNewSite = activeSiteIdRef.current !== targetSiteId;
+    if (isNewSite) {
+      activeSiteIdRef.current = targetSiteId;
+      // Isolate entity state cleanly: clear previous client's telemetry, chart history, and alarms
+      setTelemetryState({});
+      setRawHistoricalRows([]);
+      setLiveBuckets([]);
+      setAlarms([]);
+      setIsInitialTelemetryLoading(true);
+    }
 
     const fetchLatest = async () => {
-      setTelemetryLoading(true);
+      if (isNewSite) {
+        setIsInitialTelemetryLoading(true);
+      } else {
+        setIsTelemetryRefreshing(true);
+      }
+
       try {
-        const rows = await dashboardService.getLatestTelemetry(ctx.site.id);
-        // We need devices from context to group rows by BESS
-        // but ctx.devices does not have bessAssetId in the DashboardDevice interface directly, wait!
-        // The REST LatestTelemetryRow doesn't have bessAssetId. 
-        // We need it. Let's fix buildStateFromRest usage.
-        // If ctx.devices doesn't have bessAssetId... Oh, wait, we need to pass bessAssetId from the backend.
-        // For now, let's just pass rows to buildStateFromRest.
-        if (!cancelled) setTelemetryState(buildStateFromRest(rows, ctx.devices as any));
+        const rows = await dashboardService.getLatestTelemetry(targetSiteId);
+        // Strict guard: ensure effect has not been cancelled AND activeSiteId still matches targetSiteId
+        if (!cancelled && activeSiteIdRef.current === targetSiteId) {
+          const restState = buildStateFromRest(rows, ctx.devices as any);
+          const validBessIds = new Set(ctx.bessAssets.map(b => b.id));
+
+          setTelemetryState(prev => {
+            // Scope previous state strictly to valid assets of the currently active site
+            const scopedPrev: Record<string, DashboardTelemetryState> = {};
+            for (const [bessId, val] of Object.entries(prev)) {
+              if (validBessIds.has(bessId)) {
+                scopedPrev[bessId] = val;
+              }
+            }
+            return reconcileRestWithLive(scopedPrev, restState);
+          });
+        }
       } catch {
         // Non-fatal: WS will still provide live data; keep telemetry as empty
       } finally {
-        if (!cancelled) setTelemetryLoading(false);
+        if (!cancelled && activeSiteIdRef.current === targetSiteId) {
+          setIsInitialTelemetryLoading(false);
+          setIsTelemetryRefreshing(false);
+        }
       }
     };
 
@@ -450,16 +271,16 @@ export default function DashboardPage() {
   useEffect(() => {
     if (!ctx) return;
     let cancelled = false;
+    const targetSiteId = ctx.site.id;
 
     const fetchHistory = async () => {
       try {
         const now = new Date();
         const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-        const rows = await dashboardService.getHistoricalTelemetry(ctx.site.id, yesterday, now);
+        const rows = await dashboardService.getHistoricalTelemetry(targetSiteId, yesterday, now);
 
-        if (!cancelled) {
-          const trend = consolidatePowerTrendData(rows);
-          setHistoricalData(trend);
+        if (!cancelled && activeSiteIdRef.current === targetSiteId) {
+          setRawHistoricalRows(rows || []);
         }
       } catch {
         // Non-fatal — chart shows empty state
@@ -476,19 +297,23 @@ export default function DashboardPage() {
   useEffect(() => {
     if (!ctx) return;
     let cancelled = false;
+    const targetSiteId = ctx.site.id;
 
     const fetchAlarms = async () => {
       setAlarmsLoading(true);
       try {
-        const data = await alarmService.getSiteAlarms(ctx.site.id);
-        if (!cancelled) {
+        const data = await alarmService.getSiteAlarms(targetSiteId);
+        alarmAudioNotifier.seedHistoricalAlarms(data);
+        if (!cancelled && activeSiteIdRef.current === targetSiteId) {
           const active = data.filter(a => a.status === 'ACTIVE' || a.status === 'ACKNOWLEDGED');
           setAlarms(active.slice(0, 10)); // Show top active alarms
         }
       } catch {
         // Non-fatal
       } finally {
-        if (!cancelled) setAlarmsLoading(false);
+        if (!cancelled && activeSiteIdRef.current === targetSiteId) {
+          setAlarmsLoading(false);
+        }
       }
     };
 
@@ -497,97 +322,383 @@ export default function DashboardPage() {
   }, [ctx]);
 
   // ---------------------------------------------------------------------------
-  // Step 4 — WebSocket live updates (component-aware merge)
+  // Step 3c — Live Alarm Feed Updates via WebSocket
   // ---------------------------------------------------------------------------
   const siteId = ctx?.site.id;
-  const { telemetry: liveDataArray, isConnected } = useLiveTelemetry(siteId);
+  const { socket, isConnected } = useWebSocket();
+  const { telemetry: liveDataArray } = useLiveTelemetry(siteId);
 
   useEffect(() => {
-    if (liveDataArray.length === 0) return;
+    if (!ctx?.site || !socket || !isConnected) return;
+    const currentSiteId = ctx.site.id;
+
+    const handleAlarmEvent = (payload: any) => {
+      if (payload?.type === 'alarm' && payload?.siteId === currentSiteId && payload?.alarm) {
+        const newAlarm = payload.alarm as RealAlarm;
+
+        setAlarms(prev => {
+          const isTargetActive = newAlarm.status === 'ACTIVE' || newAlarm.status === 'ACKNOWLEDGED';
+          const idx = prev.findIndex(a => a.id === newAlarm.id);
+
+          if (isTargetActive) {
+            let next: RealAlarm[];
+            if (idx >= 0) {
+              next = [...prev];
+              next[idx] = newAlarm;
+            } else {
+              next = [newAlarm, ...prev];
+            }
+            return next.slice(0, 10);
+          } else {
+            if (idx >= 0) {
+              return prev.filter(a => a.id !== newAlarm.id);
+            }
+            return prev;
+          }
+        });
+      }
+    };
+
+    socket.on('alarm', handleAlarmEvent);
+    return () => {
+      socket.off('alarm', handleAlarmEvent);
+    };
+  }, [ctx?.site, socket, isConnected]);
+
+  // ---------------------------------------------------------------------------
+  // Step 4 — WebSocket live updates (component-aware merge)
+  // ---------------------------------------------------------------------------
+
+  useEffect(() => {
+    if (liveDataArray.length === 0 || !ctx) return;
 
     setChartEndTime(Date.now());
+
+    const validBessIds = new Set(ctx.bessAssets.map(b => b.id));
 
     setTelemetryState(prev => {
       let next = { ...prev };
       for (const payload of liveDataArray) {
+        // Enforce entity boundary: ignore payloads from other sites
+        if (payload.siteId && payload.siteId !== ctx.site.id) continue;
+
         // Find which BESS this device belongs to
-        const device = ctx?.devices.find(d => d.id === payload.deviceId);
-        const bessId = (device as any)?.bessAssetId || 'unknown'; // fallback if not present
+        const device = ctx.devices.find(d => d.id === payload.deviceId);
+        const bessId = (device as any)?.bessAssetId || 'unknown';
+        if (bessId !== 'unknown' && !validBessIds.has(bessId)) continue;
         
         const prevState = next[bessId] || {};
         next[bessId] = mergeWsPayload(prevState, payload.componentId, payload.data as any, payload.timestamp);
       }
       return next;
     });
-  }, [liveDataArray, ctx?.devices]);
+  }, [liveDataArray, ctx]);
 
   useEffect(() => {
     // Only proceed if at least one BESS has a timestamp
     const hasTimestamp = Object.values(telemetryState).some(s => s.timestamp);
     if (!hasTimestamp) return;
 
-    const aggregated = aggregateSiteTelemetry(telemetryState);
+    const aggregated = aggregateSiteTelemetrySafe(telemetryState);
     const nowTs = Date.now();
-    
-    setHistoricalData(prev => {
+
+    const bessMap: Record<string, { power?: number; soc?: number }> = {};
+    for (const [bessId, s] of Object.entries(telemetryState)) {
+      bessMap[bessId] = {
+        power: isValidNumber(s.bessPower) ? s.bessPower : undefined,
+        soc: isValidNumber(s.bessSoc) ? s.bessSoc : undefined,
+      };
+    }
+
+    setLiveBuckets(prev => {
       const cutoff = nowTs - 24 * 60 * 60 * 1000;
       const filtered = prev.filter(p => p.timestamp >= cutoff);
       const last = filtered[filtered.length - 1];
-      
+
       if (last && nowTs - last.timestamp < 60000) {
         filtered[filtered.length - 1] = {
-          ...last,
+          timestamp: last.timestamp,
           grid: aggregated.gridPower !== undefined ? aggregated.gridPower : last.grid,
-          bess: aggregated.bessPower !== undefined ? aggregated.bessPower : last.bess,
-          soc: aggregated.bessSoc !== undefined ? aggregated.bessSoc : last.soc,
           solar: aggregated.solarPower !== undefined ? aggregated.solarPower : last.solar,
+          bess: {
+            ...last.bess,
+            ...bessMap,
+          },
         };
         return [...filtered];
       }
-      
+
       return [...filtered, {
         timestamp: nowTs,
         grid: aggregated.gridPower,
-        bess: aggregated.bessPower,
-        soc: aggregated.bessSoc,
         solar: aggregated.solarPower,
+        bess: bessMap,
       }];
     });
   }, [telemetryState]);
 
-  // ---------------------------------------------------------------------------
-  // Freshness
-  // ---------------------------------------------------------------------------
-  
-  const aggregatedTelemetry = aggregateSiteTelemetry(telemetryState);
+  // Derived selector-aware 24h power trend dataset (historical baseline + rolling live points)
+  const historicalData = useMemo(() => {
+    const basePoints = consolidatePowerTrendData(rawHistoricalRows, {
+      devices: ctx?.devices,
+      selectedBessId,
+    });
 
-  const freshnessLabel = (() => {
-    if (!aggregatedTelemetry.timestamp) return 'NO DATA';
-    const age = Date.now() - new Date(aggregatedTelemetry.timestamp).getTime();
-    if (age > STALE_THRESHOLD_MS) return 'STALE';
-    return null; // fresh
+    if (liveBuckets.length === 0) {
+      return basePoints;
+    }
+
+    const livePoints: PowerTrendPoint[] = liveBuckets.map(bucket =>
+      resolveLivePoint(bucket, selectedBessId)
+    );
+
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const liveStartTs = livePoints[0]?.timestamp ?? Infinity;
+    const filteredBase = basePoints.filter(p => p.timestamp >= cutoff && p.timestamp < liveStartTs - 30000);
+
+    return [...filteredBase, ...livePoints];
+  }, [rawHistoricalRows, ctx?.devices, selectedBessId, liveBuckets]);
+
+  // ---------------------------------------------------------------------------
+  // Freshness & Telemetry Evaluation
+  // ---------------------------------------------------------------------------
+  const aggregatedTelemetry = aggregateSiteTelemetrySafe(telemetryState);
+
+  const isSingleBess = (ctx?.bessAssets?.length ?? 0) === 1;
+  const showBessDetails = isSingleBess || selectedBessId !== null;
+
+  // Resolve the per-BESS state to use for BESS-specific KPIs and telemetry detail tables:
+  //   - Single-BESS site  : always that one BESS (unchanged behaviour)
+  //   - Multi-BESS, All BESS selected (selectedBessId === null): undefined → falls back to aggregatedTelemetry
+  //   - Multi-BESS, specific BESS selected: that BESS's state from the map
+  // If the selected ID is not in the current site's state (stale after site switch), returns
+  // undefined safely — every consumer uses optional-chaining + aggregatedTelemetry fallback.
+  const targetBessState: DashboardTelemetryState | undefined = (() => {
+    if (!ctx) return undefined;
+    if (ctx.bessAssets.length === 1) return telemetryState[ctx.bessAssets[0].id];
+    if (selectedBessId !== null) return telemetryState[selectedBessId];
+    return undefined;
   })();
 
-  const getComponentFreshness = (ts?: string) => {
-    if (!ts) return 'NO DATA';
-    const age = Date.now() - new Date(ts).getTime();
-    return age > STALE_THRESHOLD_MS ? 'STALE' : null;
+  // Signal-level freshness evaluations
+  const gridPowerEval = evaluateSignalFreshness({
+    value: aggregatedTelemetry.gridPower,
+    measuredAt: aggregatedTelemetry.gridPowerMeasuredAt,
+    componentType: 'pmg',
+    now: clockTick,
+    decimals: 1,
+    isPowerSignal: true,
+    powerKind: 'grid',
+  });
+
+  // Site-level Grid & Solar telemetry resolution:
+  // Multiple BESS assets share the same site-level Grid and Solar systems.
+  // We resolve the site-level measurement with the latest valid timestamp,
+  // without summing, averaging, or fabricating values across BESS assets.
+  const resolveSiteMetric = (
+    valueKey: 'gridFrequency' | 'powerFactor' | 'solarFrequency' | 'solarPowerFactor',
+    measuredAtKey: 'gridFrequencyMeasuredAt' | 'powerFactorMeasuredAt' | 'solarFrequencyMeasuredAt' | 'solarPowerFactorMeasuredAt'
+  ): { value?: number; measuredAt?: string } => {
+    if (!ctx) return {};
+    const states = ctx.bessAssets.map(b => telemetryState[b.id]).filter(Boolean);
+    const validPairs = states
+      .map(s => ({ val: s[valueKey], ts: s[measuredAtKey] }))
+      .filter((p): p is { val: number; ts: string | undefined } => isValidNumber(p.val));
+
+    if (validPairs.length === 0) return {};
+
+    let best = validPairs[0];
+    let bestMs = parseValidTimestamp(best.ts) ?? -Infinity;
+
+    for (let i = 1; i < validPairs.length; i++) {
+      const ms = parseValidTimestamp(validPairs[i].ts) ?? -Infinity;
+      if (ms > bestMs) {
+        best = validPairs[i];
+        bestMs = ms;
+      }
+    }
+
+    return { value: best.val, measuredAt: best.ts };
   };
 
-  /**
-   * isStale — true when the most recent telemetry timestamp is older than
-   * STALE_THRESHOLD_MS or no timestamp exists at all.
-   * When true, KPI display values are masked to '--' so the user cannot
-   * mistake aged database values for current live readings.
-   * Underlying telemetry state and calculations are NEVER modified.
-   */
-  const isStale = freshnessLabel === 'STALE' || freshnessLabel === 'NO DATA';
-  const isPcsStale = getComponentFreshness(aggregatedTelemetry.pcsTimestamp) !== null;
-  const isPmgStale = getComponentFreshness(aggregatedTelemetry.pmgTimestamp) !== null;
-  const isPinvStale = getComponentFreshness(aggregatedTelemetry.pinvTimestamp) !== null;
-  const isBcmsStale = getComponentFreshness(aggregatedTelemetry.bcmsTimestamp) !== null;
+  const siteGridFreq = resolveSiteMetric('gridFrequency', 'gridFrequencyMeasuredAt');
+  const gridFreqEval = evaluateSignalFreshness({
+    value: siteGridFreq.value,
+    measuredAt: siteGridFreq.measuredAt,
+    componentType: 'pmg',
+    now: clockTick,
+    decimals: 2,
+    defaultSubtitle: 'Grid Frequency',
+  });
 
-  const isLive = liveDataArray.length > 0 && !isStale;
+  const siteGridPf = resolveSiteMetric('powerFactor', 'powerFactorMeasuredAt');
+  const gridPfEval = evaluateSignalFreshness({
+    value: siteGridPf.value,
+    measuredAt: siteGridPf.measuredAt,
+    componentType: 'pmg',
+    now: clockTick,
+    decimals: 2,
+    defaultSubtitle: 'Grid Power Factor',
+  });
+
+  // For each BESS metric independently:
+  // When an individual BESS is selected (selectedBessId !== null), strictly use targetBessState;
+  // if missing or unavailable on that asset, it remains undefined ("--") and NEVER falls back to
+  // the site aggregate or another BESS.
+  // When All BESS is selected (selectedBessId === null), use aggregatedTelemetry (which sums
+  // power/charge/discharge, and averages SOC/SOH/frequency/power factor across valid BESS assets).
+  const bessPowerValue = selectedBessId !== null ? targetBessState?.bessPower : aggregatedTelemetry.bessPower;
+  const bessPowerMeasuredAt = selectedBessId !== null ? targetBessState?.bessPowerMeasuredAt : aggregatedTelemetry.bessPowerMeasuredAt;
+
+  const bessPowerEval = evaluateSignalFreshness({
+    value: bessPowerValue,
+    measuredAt: bessPowerMeasuredAt,
+    componentType: 'pcs',
+    now: clockTick,
+    decimals: 1,
+    isPowerSignal: true,
+    powerKind: 'bess',
+  });
+
+  // When an individual BESS is selected, use only that BESS's own frequency/PF (strict isolation;
+  // never fall back to site aggregate). When All BESS is selected (selectedBessId === null),
+  // use the site-level arithmetic average from aggregatedTelemetry.
+  const bessFreqValue = selectedBessId !== null ? targetBessState?.bessFrequency : aggregatedTelemetry.bessFrequency;
+  const bessFreqMeasuredAt = selectedBessId !== null ? targetBessState?.bessFrequencyMeasuredAt : aggregatedTelemetry.bessFrequencyMeasuredAt;
+
+  const bessPfValue = selectedBessId !== null ? targetBessState?.bessPowerFactor : aggregatedTelemetry.bessPowerFactor;
+  const bessPfMeasuredAt = selectedBessId !== null ? targetBessState?.bessPowerFactorMeasuredAt : aggregatedTelemetry.bessPowerFactorMeasuredAt;
+
+  const bessFreqEval = evaluateSignalFreshness({
+    value: bessFreqValue,
+    measuredAt: bessFreqMeasuredAt,
+    componentType: 'pcs',
+    now: clockTick,
+    decimals: 2,
+    defaultSubtitle: 'BESS Frequency',
+  });
+
+  const bessPfEval = evaluateSignalFreshness({
+    value: bessPfValue,
+    measuredAt: bessPfMeasuredAt,
+    componentType: 'pcs',
+    now: clockTick,
+    decimals: 2,
+    defaultSubtitle: 'BESS Power Factor',
+    customFreshWindowMs: 6 * 60 * 1000, // Covers 5m full packet interval for infrequent ai_cos
+    customHoldWindowMs: 8 * 60 * 1000,  // Configured retention boundary consistent with pcs policy (8m)
+  });
+
+  const solarPowerEval = evaluateSignalFreshness({
+    value: aggregatedTelemetry.solarPower,
+    measuredAt: aggregatedTelemetry.solarPowerMeasuredAt,
+    componentType: 'pinv',
+    now: clockTick,
+    decimals: 1,
+    isPowerSignal: true,
+    powerKind: 'solar',
+  });
+
+  const siteSolarFreq = resolveSiteMetric('solarFrequency', 'solarFrequencyMeasuredAt');
+  const solarFreqEval = evaluateSignalFreshness({
+    value: siteSolarFreq.value,
+    measuredAt: siteSolarFreq.measuredAt,
+    componentType: 'pinv',
+    now: clockTick,
+    decimals: 2,
+    defaultSubtitle: 'Solar Frequency',
+  });
+
+  const siteSolarPf = resolveSiteMetric('solarPowerFactor', 'solarPowerFactorMeasuredAt');
+  const solarPfEval = evaluateSignalFreshness({
+    value: siteSolarPf.value,
+    measuredAt: siteSolarPf.measuredAt,
+    componentType: 'pinv',
+    now: clockTick,
+    decimals: 2,
+    defaultSubtitle: 'Solar Power Factor',
+  });
+
+  const bessSocValue = selectedBessId !== null ? targetBessState?.bessSoc : aggregatedTelemetry.bessSoc;
+  const bessSocMeasuredAt = selectedBessId !== null ? targetBessState?.bessSocMeasuredAt : aggregatedTelemetry.bessSocMeasuredAt;
+
+  const bessSocEval = evaluateSignalFreshness({
+    value: bessSocValue,
+    measuredAt: bessSocMeasuredAt,
+    componentType: 'bcms',
+    now: clockTick,
+    decimals: 1,
+    defaultSubtitle: 'State of charge',
+  });
+
+  const bmsSohValue = selectedBessId !== null ? targetBessState?.bmsSoh : aggregatedTelemetry.bmsSoh;
+  const bmsSohMeasuredAt = selectedBessId !== null ? targetBessState?.bmsSohMeasuredAt : aggregatedTelemetry.bmsSohMeasuredAt;
+
+  const bmsSohEval = evaluateSignalFreshness({
+    value: bmsSohValue,
+    measuredAt: bmsSohMeasuredAt,
+    componentType: 'bcms',
+    now: clockTick,
+    decimals: 1,
+    defaultSubtitle: 'State of health',
+  });
+
+  const todayChargeValue = selectedBessId !== null ? targetBessState?.todayChargeEnergy : aggregatedTelemetry.todayChargeEnergy;
+  const todayChargeMeasuredAt = selectedBessId !== null ? targetBessState?.todayChargeEnergyMeasuredAt : aggregatedTelemetry.todayChargeEnergyMeasuredAt;
+
+  const todayChargeEval = evaluateSignalFreshness({
+    value: todayChargeValue,
+    measuredAt: todayChargeMeasuredAt,
+    componentType: 'pcs',
+    now: clockTick,
+    decimals: 1,
+    defaultSubtitle: 'Since midnight',
+  });
+
+  const todayDischargeValue = selectedBessId !== null ? targetBessState?.todayDischargeEnergy : aggregatedTelemetry.todayDischargeEnergy;
+  const todayDischargeMeasuredAt = selectedBessId !== null ? targetBessState?.todayDischargeEnergyMeasuredAt : aggregatedTelemetry.todayDischargeEnergyMeasuredAt;
+
+  const todayDischargeEval = evaluateSignalFreshness({
+    value: todayDischargeValue,
+    measuredAt: todayDischargeMeasuredAt,
+    componentType: 'pcs',
+    now: clockTick,
+    decimals: 1,
+    defaultSubtitle: 'Since midnight',
+  });
+
+  // Energy Flow telemetry:
+  // - Solar PV & Grid stay site-level (from aggregatedTelemetry)
+  // - BESS power: total sum in All BESS mode, or selected BESS's own power in individual mode
+  const energyFlowData = useMemo(() => ({
+    ...aggregatedTelemetry,
+    bessPower: bessPowerValue,
+  }), [aggregatedTelemetry, bessPowerValue]);
+
+  // User unit preference formatting
+  const gridPowerFmt = formatPower(gridPowerEval.value !== undefined ? Math.abs(gridPowerEval.value) : undefined);
+  const bessPowerFmt = formatPower(bessPowerEval.value);
+  const solarPowerFmt = formatPower(solarPowerEval.value);
+  const todayChargeFmt = formatEnergy(todayChargeEval.value);
+  const todayDischargeFmt = formatEnergy(todayDischargeEval.value);
+
+  // Subsystem configuration and overall telemetry status evaluation
+  const hasPcs = (ctx?.devices?.some(d => d.componentId === 'pcs') ?? false) || (ctx?.bessAssets?.length ?? 0) > 0;
+  const hasGridMeter = ctx?.devices?.some(d => d.componentId === 'pmg') ?? false;
+  const hasSolarInverter = ctx?.devices?.some(d => d.componentId === 'pinv') ?? false;
+
+  const configuredSubsystems: SubsystemFreshnessInput[] = [
+    { id: 'pcs', name: 'BESS', isConfigured: hasPcs, evaluation: bessPowerEval },
+    { id: 'pmg', name: 'Grid', isConfigured: hasGridMeter, evaluation: gridPowerEval },
+    { id: 'pinv', name: 'Solar', isConfigured: hasSolarInverter, evaluation: solarPowerEval },
+  ];
+
+  const overallTelemetry = evaluateOverallTelemetryStatus({
+    isConnected,
+    hasPacketsReceived: liveDataArray.length > 0 || Object.keys(telemetryState).length > 0,
+    subsystems: configuredSubsystems,
+  });
+
 
   // ---------------------------------------------------------------------------
   // Render guards
@@ -609,6 +720,12 @@ export default function DashboardPage() {
 
   if (!ctx) return null;
 
+  // Determine whether initial loading skeleton should be shown:
+  // Only show the skeleton when we do not yet have telemetry data for the active site.
+  // During normal background refreshes, existing telemetry remains rendered and updates in-place.
+  const hasTelemetry = Object.keys(telemetryState).length > 0;
+  const showInitialSkeleton = isInitialTelemetryLoading && !hasTelemetry;
+
   // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
@@ -618,24 +735,56 @@ export default function DashboardPage() {
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-slate-900">EMS Dashboard</h1>
+          {/* Site context subtitle and (for multi-BESS) the BESS view selector */}
           <div className="flex items-center gap-2 mt-1 flex-wrap">
-            <p className="text-sm text-slate-500">
-              {ctx.client.name} — {ctx.site.name} — {ctx.bessAssets.length > 1 ? `Site Aggregation (${ctx.bessAssets.length} BESS)` : ctx.bessAssets[0]?.name}
-            </p>
-            {/* Connection badge */}
-            {isLive ? (
+            {ctx.bessAssets.length > 1 ? (
+              <>
+                <p className="text-sm text-slate-500">
+                  {ctx.client.name} — {ctx.site.name}
+                  {selectedBessId !== null
+                    ? ` — ${ctx.bessAssets.find(b => b.id === selectedBessId)?.name ?? 'Selected BESS'}`
+                    : ` — Site Overview (${ctx.bessAssets.length} BESS)`}
+                </p>
+                <BessViewSelector
+                  bessAssets={ctx.bessAssets}
+                  selectedBessId={selectedBessId}
+                  onSelect={setSelectedBessId}
+                />
+              </>
+            ) : (
+              <p className="text-sm text-slate-500">
+                {ctx.client.name} — {ctx.site.name} — {ctx.bessAssets[0]?.name}
+              </p>
+            )}
+            {/* Connection & Telemetry Stream status badge */}
+            {overallTelemetry.state === 'LIVE' && (
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 text-xs font-medium">
                 <Wifi className="w-3 h-3" /> LIVE
               </span>
-            ) : (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-xs font-medium">
-                <WifiOff className="w-3 h-3" /> {isConnected ? 'CONNECTED — Waiting for live updates' : 'DISCONNECTED'}
+            )}
+            {overallTelemetry.state === 'PARTIAL_STREAM' && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-xs font-medium">
+                <AlertTriangle className="w-3 h-3" /> PARTIAL STREAM
               </span>
             )}
-            {/* Freshness badge */}
-            {freshnessLabel && (
-              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 text-xs font-medium">
-                {freshnessLabel}
+            {overallTelemetry.state === 'STALE' && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-xs font-medium">
+                <Clock className="w-3 h-3" /> STALE
+              </span>
+            )}
+            {overallTelemetry.state === 'WAITING_FOR_DATA' && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-xs font-medium">
+                <Wifi className="w-3 h-3" /> CONNECTED — Waiting for live updates
+              </span>
+            )}
+            {overallTelemetry.state === 'DISCONNECTED' && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-xs font-medium">
+                <WifiOff className="w-3 h-3" /> DISCONNECTED
+              </span>
+            )}
+            {isTelemetryRefreshing && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-500 text-xs font-medium animate-pulse">
+                <RefreshCw className="w-3 h-3 animate-spin" /> Refreshing...
               </span>
             )}
           </div>
@@ -645,15 +794,19 @@ export default function DashboardPage() {
         <div className="flex items-center gap-2 bg-white px-4 py-2 rounded-lg border border-slate-200 shadow-sm">
           <div className="flex flex-col">
             <span className="text-xs font-medium text-slate-500 uppercase tracking-wider">System Status</span>
-            <span className="text-sm font-semibold text-slate-900 mt-0.5">
-              {isLive ? 'System Online' : (isConnected ? 'Connected' : 'Disconnected')}
+            <span className={`text-sm font-semibold mt-0.5 ${
+              overallTelemetry.state === 'LIVE' ? 'text-emerald-700' :
+              overallTelemetry.state === 'PARTIAL_STREAM' ? 'text-amber-700' :
+              'text-slate-900'
+            }`}>
+              {overallTelemetry.systemStatusLabel}
             </span>
           </div>
         </div>
       </div>
 
       {/* KPI Section */}
-      {telemetryLoading ? (
+      {showInitialSkeleton ? (
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 animate-pulse">
           {[...Array(4)].map((_, i) => <div key={i} className="h-28 bg-slate-100 rounded-xl" />)}
         </div>
@@ -666,201 +819,114 @@ export default function DashboardPage() {
             <div className="flex flex-col gap-4">
               <h2 className="text-lg font-semibold text-slate-900">GRID</h2>
               <AdvancedKPICard
+                key="kpi-grid-power"
                 title="Grid Power"
-                value={aggregatedTelemetry.gridPower !== undefined ? Math.abs(aggregatedTelemetry.gridPower) : undefined}
-                displayValue={isPmgStale ? '--' : (aggregatedTelemetry.gridPower !== undefined ? formatValue(Math.abs(aggregatedTelemetry.gridPower)) : '--')}
-                unit="kW"
+                value={gridPowerEval.value !== undefined ? Math.abs(gridPowerEval.value) : undefined}
+                displayValue={gridPowerEval.isAvailable && !gridPowerEval.isStale ? gridPowerFmt.displayValue : gridPowerEval.displayValue}
+                unit={gridPowerEval.isAvailable && !gridPowerEval.isStale ? gridPowerFmt.unit : ""}
                 icon={<Zap className="w-5 h-5" />}
                 statusColor="amber"
                 delay={0.1}
-                subtitle={
-                  isPmgStale
-                    ? 'Stale'
-                    : aggregatedTelemetry.gridPower !== undefined
-                      ? aggregatedTelemetry.gridPower !== 0 ? 'Active' : 'Idle'
-                      : 'No data'
-                }
+                subtitle={gridPowerEval.subtitle}
               />
-              {ctx.bessAssets.length === 1 ? (
-                <AdvancedKPICard
-                  title="Grid Frequency"
-                  value={telemetryState[ctx.bessAssets[0].id]?.gridFrequency}
-                  displayValue={isPmgStale ? '--' : formatValue(telemetryState[ctx.bessAssets[0].id]?.gridFrequency, 2)}
-                  unit="Hz"
-                  icon={<Bolt className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.15}
-                  subtitle={isPmgStale ? 'Stale' : 'Grid Frequency'}
-                />
-              ) : (
-                <AdvancedKPICard
-                  title="Grid Frequency"
-                  value={undefined}
-                  displayValue="—"
-                  unit=""
-                  icon={<Bolt className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.15}
-                  subtitle="Per-BESS Metric"
-                />
-              )}
-              {ctx.bessAssets.length === 1 ? (
-                <AdvancedKPICard
-                  title="Grid Power Factor"
-                  value={telemetryState[ctx.bessAssets[0].id]?.powerFactor}
-                  displayValue={isPmgStale ? '--' : formatValue(telemetryState[ctx.bessAssets[0].id]?.powerFactor, 2)}
-                  unit="PF"
-                  icon={<Activity className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.18}
-                  subtitle={isPmgStale ? 'Stale' : 'Grid Power Factor'}
-                />
-              ) : (
-                <AdvancedKPICard
-                  title="Grid Power Factor"
-                  value={undefined}
-                  displayValue="—"
-                  unit=""
-                  icon={<Activity className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.18}
-                  subtitle="Per-BESS Metric"
-                />
-              )}
+              <AdvancedKPICard
+                key="kpi-grid-frequency"
+                title="Grid Frequency"
+                value={gridFreqEval.value}
+                displayValue={gridFreqEval.displayValue}
+                unit={gridFreqEval.isAvailable && !gridFreqEval.isStale ? "Hz" : ""}
+                icon={<Bolt className="w-5 h-5" />}
+                statusColor="slate"
+                delay={0.15}
+                subtitle={gridFreqEval.subtitle}
+              />
+              <AdvancedKPICard
+                key="kpi-grid-pf"
+                title="Grid Power Factor"
+                value={gridPfEval.value}
+                displayValue={gridPfEval.displayValue}
+                unit={gridPfEval.isAvailable && !gridPfEval.isStale ? "PF" : ""}
+                icon={<Activity className="w-5 h-5" />}
+                statusColor="slate"
+                delay={0.18}
+                subtitle={gridPfEval.subtitle}
+              />
             </div>
 
             {/* BESS Column */}
             <div className="flex flex-col gap-4">
               <h2 className="text-lg font-semibold text-slate-900">BESS</h2>
               <AdvancedKPICard
+                key="kpi-bess-power"
                 title="BESS Power"
-                value={aggregatedTelemetry.bessPower}
-                displayValue={isPcsStale ? '--' : (aggregatedTelemetry.bessPower !== undefined ? formatValue(aggregatedTelemetry.bessPower) : '--')}
-                unit="kW"
+                value={bessPowerEval.value}
+                displayValue={bessPowerEval.isAvailable && !bessPowerEval.isStale ? bessPowerFmt.displayValue : bessPowerEval.displayValue}
+                unit={bessPowerEval.isAvailable && !bessPowerEval.isStale ? bessPowerFmt.unit : ""}
                 icon={<BatteryMedium className="w-5 h-5" />}
                 statusColor="blue"
                 delay={0.2}
-                subtitle={
-                  isPcsStale
-                    ? 'Stale'
-                    : aggregatedTelemetry.bessPower !== undefined
-                      ? aggregatedTelemetry.bessPower > 0 ? 'Charging' : aggregatedTelemetry.bessPower < 0 ? 'Discharging' : 'Idle'
-                      : 'No data'
-                }
+                subtitle={bessPowerEval.subtitle}
               />
-              {ctx.bessAssets.length === 1 ? (
-                <AdvancedKPICard
-                  title="BESS Frequency"
-                  value={telemetryState[ctx.bessAssets[0].id]?.bessFrequency}
-                  displayValue={isPcsStale ? '--' : formatValue(telemetryState[ctx.bessAssets[0].id]?.bessFrequency, 2)}
-                  unit="Hz"
-                  icon={<Bolt className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.22}
-                  subtitle={isPcsStale ? 'Stale' : 'BESS Frequency'}
-                />
-              ) : (
-                <AdvancedKPICard
-                  title="BESS Frequency"
-                  value={undefined}
-                  displayValue="—"
-                  unit=""
-                  icon={<Bolt className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.22}
-                  subtitle="Per-BESS Metric"
-                />
-              )}
-              {ctx.bessAssets.length === 1 ? (
-                <AdvancedKPICard
-                  title="BESS Power Factor"
-                  value={telemetryState[ctx.bessAssets[0].id]?.bessPowerFactor}
-                  displayValue={isPcsStale ? '--' : formatValue(telemetryState[ctx.bessAssets[0].id]?.bessPowerFactor, 2)}
-                  unit="PF"
-                  icon={<Activity className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.24}
-                  subtitle={isPcsStale ? 'Stale' : 'BESS Power Factor'}
-                />
-              ) : (
-                <AdvancedKPICard
-                  title="BESS Power Factor"
-                  value={undefined}
-                  displayValue="—"
-                  unit=""
-                  icon={<Activity className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.24}
-                  subtitle="Per-BESS Metric"
-                />
-              )}
+              <AdvancedKPICard
+                key="kpi-bess-frequency"
+                title="BESS Frequency"
+                value={bessFreqEval.value}
+                displayValue={bessFreqEval.displayValue}
+                unit={bessFreqEval.isAvailable && !bessFreqEval.isStale ? "Hz" : ""}
+                icon={<Bolt className="w-5 h-5" />}
+                statusColor="slate"
+                delay={0.22}
+                subtitle={bessFreqEval.subtitle}
+              />
+              <AdvancedKPICard
+                key="kpi-bess-pf"
+                title="BESS Power Factor"
+                value={bessPfEval.value}
+                displayValue={bessPfEval.displayValue}
+                unit={bessPfEval.isAvailable && !bessPfEval.isStale ? "PF" : ""}
+                icon={<Activity className="w-5 h-5" />}
+                statusColor="slate"
+                delay={0.24}
+                subtitle={bessPfEval.subtitle}
+              />
             </div>
 
             {/* SOLAR PV Column */}
             <div className="flex flex-col gap-4">
               <h2 className="text-lg font-semibold text-slate-900">SOLAR PV</h2>
               <AdvancedKPICard
+                key="kpi-solar-power"
                 title="Solar PV Power"
-                value={aggregatedTelemetry.solarPower}
-                displayValue={isPinvStale ? '--' : (aggregatedTelemetry.solarPower !== undefined ? formatValue(aggregatedTelemetry.solarPower) : '--')}
-                unit="kW"
+                value={solarPowerEval.value}
+                displayValue={solarPowerEval.isAvailable && !solarPowerEval.isStale ? solarPowerFmt.displayValue : solarPowerEval.displayValue}
+                unit={solarPowerEval.isAvailable && !solarPowerEval.isStale ? solarPowerFmt.unit : ""}
                 icon={<Sun className="w-5 h-5" />}
                 statusColor="amber"
                 delay={0.25}
-                subtitle={
-                  isPinvStale
-                    ? 'Stale'
-                    : aggregatedTelemetry.solarPower !== undefined
-                      ? aggregatedTelemetry.solarPower > 0 ? 'Generating' : 'Idle'
-                      : 'No data'
-                }
+                subtitle={solarPowerEval.subtitle}
               />
-              {ctx.bessAssets.length === 1 ? (
-                <AdvancedKPICard
-                  title="Solar Frequency"
-                  value={telemetryState[ctx.bessAssets[0].id]?.solarFrequency}
-                  displayValue={isPinvStale ? '--' : formatValue(telemetryState[ctx.bessAssets[0].id]?.solarFrequency, 2)}
-                  unit="Hz"
-                  icon={<Bolt className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.27}
-                  subtitle={isPinvStale ? 'Stale' : 'Solar Frequency'}
-                />
-              ) : (
-                <AdvancedKPICard
-                  title="Solar Frequency"
-                  value={undefined}
-                  displayValue="—"
-                  unit=""
-                  icon={<Bolt className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.27}
-                  subtitle="Per-BESS Metric"
-                />
-              )}
-              {ctx.bessAssets.length === 1 ? (
-                <AdvancedKPICard
-                  title="Solar Power Factor"
-                  value={telemetryState[ctx.bessAssets[0].id]?.solarPowerFactor}
-                  displayValue={isPinvStale ? '--' : formatValue(telemetryState[ctx.bessAssets[0].id]?.solarPowerFactor, 2)}
-                  unit="PF"
-                  icon={<Activity className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.29}
-                  subtitle={isPinvStale ? 'Stale' : 'Solar Power Factor'}
-                />
-              ) : (
-                <AdvancedKPICard
-                  title="Solar Power Factor"
-                  value={undefined}
-                  displayValue="—"
-                  unit=""
-                  icon={<Activity className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.29}
-                  subtitle="Per-BESS Metric"
-                />
-              )}
+              <AdvancedKPICard
+                key="kpi-solar-frequency"
+                title="Solar Frequency"
+                value={solarFreqEval.value}
+                displayValue={solarFreqEval.displayValue}
+                unit={solarFreqEval.isAvailable && !solarFreqEval.isStale ? "Hz" : ""}
+                icon={<Bolt className="w-5 h-5" />}
+                statusColor="slate"
+                delay={0.27}
+                subtitle={solarFreqEval.subtitle}
+              />
+              <AdvancedKPICard
+                key="kpi-solar-pf"
+                title="Solar Power Factor"
+                value={solarPfEval.value}
+                displayValue={solarPfEval.displayValue}
+                unit={solarPfEval.isAvailable && !solarPfEval.isStale ? "PF" : ""}
+                icon={<Activity className="w-5 h-5" />}
+                statusColor="slate"
+                delay={0.29}
+                subtitle={solarPfEval.subtitle}
+              />
             </div>
           </div>
 
@@ -868,78 +934,49 @@ export default function DashboardPage() {
           <div>
             <h2 className="text-lg font-semibold text-slate-900 mb-3">Other Metrics</h2>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-              {ctx.bessAssets.length === 1 ? (
-                <AdvancedKPICard
-                  title="DC Voltage"
-                  value={telemetryState[ctx.bessAssets[0].id]?.pcsDcVoltage}
-                  displayValue={isPcsStale ? '--' : formatValue(telemetryState[ctx.bessAssets[0].id]?.pcsDcVoltage, 1)}
-                  unit="V"
-                  icon={<Bolt className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.3}
-                  subtitle={isPcsStale ? 'Stale' : 'PCS DC bus'}
-                />
-              ) : (
-                <AdvancedKPICard
-                  title="DC Voltage"
-                  value={undefined}
-                  displayValue="—"
-                  unit=""
-                  icon={<Bolt className="w-5 h-5" />}
-                  statusColor="slate"
-                  delay={0.3}
-                  subtitle="Per-BESS Metric"
-                />
-              )}
               <AdvancedKPICard
-                title="PCS Temp"
-                value={aggregatedTelemetry.pcsTemp}
-                displayValue={isPcsStale ? '--' : formatValue(aggregatedTelemetry.pcsTemp, 1)}
-                unit="°C"
-                icon={<Thermometer className="w-5 h-5" />}
-                statusColor="slate"
-                delay={0.4}
-                subtitle={isPcsStale ? 'Stale' : 'IGBT temperature'}
-              />
-              <AdvancedKPICard
+                key="kpi-bess-soc"
                 title="BESS SOC"
-                value={aggregatedTelemetry.bessSoc}
-                displayValue={isBcmsStale ? '--' : (aggregatedTelemetry.bessSoc !== undefined ? `${aggregatedTelemetry.bessSoc.toFixed(1)}` : '--')}
-                unit={(!isBcmsStale && aggregatedTelemetry.bessSoc !== undefined) ? '%' : ''}
+                value={bessSocEval.value}
+                displayValue={bessSocEval.displayValue}
+                unit={bessSocEval.isAvailable && !bessSocEval.isStale ? "%" : ""}
                 icon={<ShieldCheck className="w-5 h-5" />}
                 statusColor="slate"
                 delay={0.5}
-                subtitle={isBcmsStale ? 'Stale' : (aggregatedTelemetry.bessSoc !== undefined ? 'State of charge' : 'Not Available')}
+                subtitle={bessSocEval.subtitle}
               />
               <AdvancedKPICard
+                key="kpi-bms-soh"
                 title="BESS SOH"
-                value={aggregatedTelemetry.bmsSoh}
-                displayValue={isBcmsStale ? '--' : (aggregatedTelemetry.bmsSoh !== undefined ? `${aggregatedTelemetry.bmsSoh.toFixed(1)}` : '--')}
-                unit={(!isBcmsStale && aggregatedTelemetry.bmsSoh !== undefined) ? '%' : ''}
+                value={bmsSohEval.value}
+                displayValue={bmsSohEval.displayValue}
+                unit={bmsSohEval.isAvailable && !bmsSohEval.isStale ? "%" : ""}
                 icon={<ShieldCheck className="w-5 h-5" />}
                 statusColor="slate"
                 delay={0.55}
-                subtitle={isBcmsStale ? 'Stale' : (aggregatedTelemetry.bmsSoh !== undefined ? 'State of health' : 'Not Available')}
+                subtitle={bmsSohEval.subtitle}
               />
               <AdvancedKPICard
+                key="kpi-today-charge"
                 title="Today Charge"
-                value={aggregatedTelemetry.todayChargeEnergy}
-                displayValue={isPcsStale ? '--' : formatValue(aggregatedTelemetry.todayChargeEnergy, 1)}
-                unit="kWh"
+                value={todayChargeEval.value}
+                displayValue={todayChargeEval.isAvailable && !todayChargeEval.isStale ? todayChargeFmt.displayValue : todayChargeEval.displayValue}
+                unit={todayChargeEval.isAvailable && !todayChargeEval.isStale ? todayChargeFmt.unit : ""}
                 icon={<BatteryMedium className="w-5 h-5" />}
                 statusColor="emerald"
                 delay={0.6}
-                subtitle={isPcsStale ? 'Stale' : 'Since midnight'}
+                subtitle={todayChargeEval.subtitle}
               />
               <AdvancedKPICard
+                key="kpi-today-discharge"
                 title="Today Discharge"
-                value={aggregatedTelemetry.todayDischargeEnergy}
-                displayValue={isPcsStale ? '--' : formatValue(aggregatedTelemetry.todayDischargeEnergy, 1)}
-                unit="kWh"
+                value={todayDischargeEval.value}
+                displayValue={todayDischargeEval.isAvailable && !todayDischargeEval.isStale ? todayDischargeFmt.displayValue : todayDischargeEval.displayValue}
+                unit={todayDischargeEval.isAvailable && !todayDischargeEval.isStale ? todayDischargeFmt.unit : ""}
                 icon={<BatteryMedium className="w-5 h-5" />}
                 statusColor="slate"
                 delay={0.7}
-                subtitle={isPcsStale ? 'Stale' : 'Since midnight'}
+                subtitle={todayDischargeEval.subtitle}
               />
 
             </div>
@@ -950,7 +987,13 @@ export default function DashboardPage() {
       {/* Energy Flow */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         <div className="lg:col-span-2">
-          <EnergyFlowDiagram data={aggregatedTelemetry} isStale={isStale} />
+          <EnergyFlowDiagram
+            data={energyFlowData}
+            powerUnit={preferences.powerUnit}
+            isGridStale={gridPowerEval.isStale || gridPowerEval.isNoData}
+            isBessStale={bessPowerEval.isStale || bessPowerEval.isNoData}
+            isSolarStale={solarPowerEval.isStale || solarPowerEval.isNoData}
+          />
         </div>
 
         {/* Alarms panel */}
@@ -1004,6 +1047,67 @@ export default function DashboardPage() {
         </div>
       </div>
 
+      {/* Conditional BESS Detail Sections (Visible only for Individual BESS or Single-BESS Client) */}
+      {showBessDetails && (
+        <>
+          {/* Battery Status Section */}
+          <BatteryStatusSection
+            batteryAmbientTemp={targetBessState?.batteryAmbientTemp}
+            batteryAmbientMeasuredAt={targetBessState?.batteryAmbientTempMeasuredAt}
+            packTemperatures={targetBessState?.packTemperatures}
+            bessSocEval={bessSocEval}
+          />
+
+          {/* Cabinet State Indicator */}
+          <CabinetStateIndicator
+            cabinetState={targetBessState?.bmsCabinetState}
+            cabinetStateMeasuredAt={targetBessState?.bmsCabinetStateMeasuredAt}
+          />
+
+          {/* Telemetry Tables Section (PCS, BMS, TMS) */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 items-start">
+            <PcsTelemetryTable
+              pcsTemperature={targetBessState?.pcsTemperature}
+              pcsTemperatureMeasuredAt={targetBessState?.pcsTemperatureMeasuredAt}
+              pcsLineVoltage={targetBessState?.pcsLineVoltage}
+              pcsLineVoltageMeasuredAt={targetBessState?.pcsLineVoltageMeasuredAt}
+              pcsAcCurrent={targetBessState?.pcsAcCurrent}
+              pcsAcCurrentMeasuredAt={targetBessState?.pcsAcCurrentMeasuredAt}
+              tmsAmbientTemp={targetBessState?.tmsAmbientTemp}
+              tmsAmbientTempMeasuredAt={targetBessState?.tmsAmbientTempMeasuredAt}
+            />
+            <BmsTelemetryTable
+              cellVMax={targetBessState?.cellVMax}
+              cellVMaxMeasuredAt={targetBessState?.cellVMaxMeasuredAt}
+              cellVMin={targetBessState?.cellVMin}
+              cellVMinMeasuredAt={targetBessState?.cellVMinMeasuredAt}
+              cellTempMax={targetBessState?.cellTempMax}
+              cellTempMaxMeasuredAt={targetBessState?.cellTempMaxMeasuredAt}
+              cellTempMin={targetBessState?.cellTempMin}
+              cellTempMinMeasuredAt={targetBessState?.cellTempMinMeasuredAt}
+              bmsDcVoltage={targetBessState?.bmsDcVoltage}
+              bmsDcVoltageMeasuredAt={targetBessState?.bmsDcVoltageMeasuredAt}
+              bmsCurrent={targetBessState?.bmsCurrent}
+              bmsCurrentMeasuredAt={targetBessState?.bmsCurrentMeasuredAt}
+            />
+            <TmsTelemetryTable
+              tmsAmbientTemp={targetBessState?.tmsAmbientTemp}
+              tmsAmbientTempMeasuredAt={targetBessState?.tmsAmbientTempMeasuredAt}
+              tmsCoolantReturnTemp={targetBessState?.tmsCoolantReturnTemp}
+              tmsCoolantReturnTempMeasuredAt={targetBessState?.tmsCoolantReturnTempMeasuredAt}
+              tmsCoolantInletTemp={targetBessState?.tmsCoolantInletTemp}
+              tmsCoolantInletTempMeasuredAt={targetBessState?.tmsCoolantInletTempMeasuredAt}
+              tmsCoolantReturnPressure={targetBessState?.tmsCoolantReturnPressure}
+              tmsCoolantReturnPressureMeasuredAt={targetBessState?.tmsCoolantReturnPressureMeasuredAt}
+              tmsCoolantInletPressure={targetBessState?.tmsCoolantInletPressure}
+              tmsCoolantInletPressureMeasuredAt={targetBessState?.tmsCoolantInletPressureMeasuredAt}
+              tmsOperatingMode={targetBessState?.tmsOperatingMode}
+              tmsOperatingModeMeasuredAt={targetBessState?.tmsOperatingModeMeasuredAt}
+            />
+          </div>
+        </>
+      )}
+
       {/* Power Trend Chart */}
       <div className="h-[450px]">
         <PowerTrendChart
@@ -1011,6 +1115,10 @@ export default function DashboardPage() {
           title="24-Hour Power Trend"
           description="Grid and BESS power from live telemetry."
           domain={[chartEndTime - 24 * 60 * 60 * 1000, chartEndTime]}
+          powerUnit={preferences.powerUnit}
+          timeFormat={preferences.timeFormat}
+          dateFormat={preferences.dateFormat}
+          timeZone={resolvedTimezone}
         />
       </div>
 
@@ -1019,59 +1127,12 @@ export default function DashboardPage() {
         <BessChargeDischargeChart
           data={historicalData}
           domain={[chartEndTime - 24 * 60 * 60 * 1000, chartEndTime]}
+          powerUnit={preferences.powerUnit}
+          timeFormat={preferences.timeFormat}
+          dateFormat={preferences.dateFormat}
+          timeZone={resolvedTimezone}
         />
       </div>
-
-      {/* Phase Voltages & Currents (when rjl data is available) */}
-      {ctx.bessAssets.length === 1 && (aggregatedTelemetry.voltageA !== undefined || aggregatedTelemetry.voltageB !== undefined || aggregatedTelemetry.voltageC !== undefined ||
-        aggregatedTelemetry.currentA !== undefined || aggregatedTelemetry.currentB !== undefined || aggregatedTelemetry.currentC !== undefined) && (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-          <h3 className="text-lg font-semibold text-slate-900 mb-4">Cabinet Meter (RJL)</h3>
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
-            {[
-              { label: 'Phase A V', value: formatValue(aggregatedTelemetry.voltageA, 1), unit: 'V' },
-              { label: 'Phase B V', value: formatValue(aggregatedTelemetry.voltageB, 1), unit: 'V' },
-              { label: 'Phase C V', value: formatValue(aggregatedTelemetry.voltageC, 1), unit: 'V' },
-              { label: 'Phase A I', value: formatValue(aggregatedTelemetry.currentA, 1), unit: 'A' },
-              { label: 'Phase B I', value: formatValue(aggregatedTelemetry.currentB, 1), unit: 'A' },
-              { label: 'Phase C I', value: formatValue(aggregatedTelemetry.currentC, 1), unit: 'A' },
-            ].map(({ label, value, unit }) => (
-              <div key={label} className="text-center p-3 bg-slate-50 rounded-lg border border-slate-100">
-                <p className="text-xs text-slate-500 uppercase tracking-wider">{label}</p>
-                <p className="text-xl font-bold text-slate-900 mt-1">{value}</p>
-                <p className="text-xs text-slate-400">{unit}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Per-BESS Metrics for Multi-BESS Site */}
-      {ctx.bessAssets.length > 1 && (
-        <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-6">
-          <h3 className="text-lg font-semibold text-slate-900 mb-4">Per-BESS Metrics</h3>
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm text-slate-600">
-              <thead className="border-b border-slate-200">
-                <tr>
-                  <th className="pb-3 font-semibold text-slate-900">BESS Asset</th>
-                  <th className="pb-3 font-semibold text-slate-900">DC Voltage (V)</th>
-                  <th className="pb-3 font-semibold text-slate-900">Phase A Voltage (V)</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {ctx.bessAssets.map(b => (
-                  <tr key={b.id}>
-                    <td className="py-3 font-medium text-slate-900 pr-4 whitespace-nowrap">{b.name}</td>
-                    <td className="py-3 whitespace-nowrap">{isStale ? '--' : formatValue(telemetryState[b.id]?.pcsDcVoltage, 1)}</td>
-                    <td className="py-3 whitespace-nowrap">{isStale ? '--' : formatValue(telemetryState[b.id]?.voltageA, 1)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

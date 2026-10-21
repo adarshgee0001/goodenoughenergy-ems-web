@@ -2,17 +2,36 @@ import { useMemo } from 'react';
 import { ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine } from 'recharts';
 import { BatteryMedium } from 'lucide-react';
 import type { PowerTrendPoint } from '../../../features/dashboard/dashboard.types';
+import type { PowerUnit, TimeFormat, DateFormat } from '../../../features/settings/settings.types';
+import { formatDateCustom, formatTimeCustom, formatDateTimeCustom, getDateParts, getNextHourInTz } from '../../../features/settings/settings.utils';
 
 interface BessChargeDischargeChartProps {
   data: PowerTrendPoint[];
   domain: [number, number];
+  powerUnit?: PowerUnit;
+  timeFormat?: TimeFormat;
+  dateFormat?: DateFormat;
+  timeZone?: string;
 }
 
-const CustomTooltip = ({ active, payload, label }: any) => {
+const CustomTooltip = ({
+  active,
+  payload,
+  label,
+  isMW = false,
+  timeFormat = '12h',
+  dateFormat = 'DD MMM YYYY',
+  durationHours = 24,
+  timeZone,
+}: any) => {
   if (active && payload && payload.length) {
-    const timeLabel = new Date(label).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const timeLabel = durationHours <= 26
+      ? formatTimeCustom(label, timeFormat, false, timeZone)
+      : formatDateTimeCustom(label, dateFormat, timeFormat, false, timeZone);
     // Use the exact 2-minute source data for tooltips, decoupling it from the 10-minute rendered bars
     const dataPoint = payload[0].payload;
+    const unit = isMW ? 'MW' : 'kW';
+    const decimals = isMW ? 2 : 1;
     
     return (
       <div className="bg-white p-3 border border-slate-200 shadow-md rounded-lg min-w-[180px]">
@@ -24,7 +43,7 @@ const CustomTooltip = ({ active, payload, label }: any) => {
                 <div className="w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: '#2196F3' }} />
                 <span className="text-sm font-medium text-slate-600">Charge</span>
               </div>
-              <span className="text-sm font-bold text-slate-900">{Number(dataPoint.sourceCharge).toFixed(1)} kW</span>
+              <span className="text-sm font-bold text-slate-900">{Number(dataPoint.sourceCharge).toFixed(decimals)} {unit}</span>
             </div>
           )}
           {dataPoint.sourceDischarge !== null && dataPoint.sourceDischarge !== undefined && (
@@ -33,7 +52,7 @@ const CustomTooltip = ({ active, payload, label }: any) => {
                 <div className="w-2.5 h-2.5 rounded-sm" style={{ backgroundColor: '#FF7A4D' }} />
                 <span className="text-sm font-medium text-slate-600">Discharge</span>
               </div>
-              <span className="text-sm font-bold text-slate-900">{Number(dataPoint.sourceDischarge).toFixed(1)} kW</span>
+              <span className="text-sm font-bold text-slate-900">{Number(dataPoint.sourceDischarge).toFixed(decimals)} {unit}</span>
             </div>
           )}
           {dataPoint.soc !== null && dataPoint.soc !== undefined && (
@@ -66,7 +85,12 @@ const renderSparseDot = (props: any) => {
 export const BessChargeDischargeChart = ({
   data,
   domain,
+  powerUnit = 'kW',
+  timeFormat = '12h',
+  dateFormat = 'DD MMM YYYY',
+  timeZone,
 }: BessChargeDischargeChartProps) => {
+  const isMW = powerUnit === 'MW';
   const hasData = data.length > 0;
   
   // Downsample/interpolate to strictly 2-minute resolution across the entire domain
@@ -75,6 +99,7 @@ export const BessChargeDischargeChart = ({
     const barMs = 10 * 60 * 1000; // 10 minutes for visual bars (144 buckets)
     const startMs = Math.floor(domain[0] / sourceMs) * sourceMs;
     const endMs = Math.floor(domain[1] / sourceMs) * sourceMs;
+    const factor = isMW ? 1000 : 1;
     
     const timeline = new Map();
     const barBuckets = new Map();
@@ -93,27 +118,49 @@ export const BessChargeDischargeChart = ({
     data.forEach(pt => {
       // 2-minute source precision
       const sourceTs = Math.floor(pt.timestamp / sourceMs) * sourceMs;
-      if (timeline.has(sourceTs)) {
-        const b = timeline.get(sourceTs);
-        if (pt.bess !== undefined && pt.bess !== null) {
-          if (pt.bess > 0) b.chargeSum += pt.bess;
-          if (pt.bess < 0) b.dischargeSum += pt.bess;
-          b.powerCount++;
-        }
-        if (pt.soc !== undefined && pt.soc !== null) {
-          b.socSum += pt.soc;
-          b.socCount++;
-        }
-      }
-      
       // 10-minute visual precision
       const barTs = Math.floor(pt.timestamp / barMs) * barMs;
-      if (barBuckets.has(barTs)) {
-        const bb = barBuckets.get(barTs);
-        if (pt.bess !== undefined && pt.bess !== null) {
-          if (pt.bess > 0) bb.chargeSum += pt.bess;
-          if (pt.bess < 0) bb.dischargeSum += pt.bess;
+
+      const hasCharge = pt.bessCharge !== undefined && pt.bessCharge !== null && Number.isFinite(pt.bessCharge);
+      const hasDischarge = pt.bessDischarge !== undefined && pt.bessDischarge !== null && Number.isFinite(pt.bessDischarge);
+      const hasBess = pt.bess !== undefined && pt.bess !== null && Number.isFinite(pt.bess);
+
+      if (hasCharge || hasDischarge) {
+        const c = hasCharge && pt.bessCharge! > 0 ? pt.bessCharge! : 0;
+        const d = hasDischarge && pt.bessDischarge! !== 0 ? (pt.bessDischarge! < 0 ? pt.bessDischarge! : -Math.abs(pt.bessDischarge!)) : 0;
+
+        if (timeline.has(sourceTs)) {
+          const b = timeline.get(sourceTs);
+          b.chargeSum += c;
+          b.dischargeSum += d;
+          b.powerCount++;
+        }
+        if (barBuckets.has(barTs)) {
+          const bb = barBuckets.get(barTs);
+          bb.chargeSum += c;
+          bb.dischargeSum += d;
           bb.powerCount++;
+        }
+      } else if (hasBess) {
+        if (timeline.has(sourceTs)) {
+          const b = timeline.get(sourceTs);
+          if (pt.bess! > 0) b.chargeSum += pt.bess!;
+          if (pt.bess! < 0) b.dischargeSum += pt.bess!;
+          b.powerCount++;
+        }
+        if (barBuckets.has(barTs)) {
+          const bb = barBuckets.get(barTs);
+          if (pt.bess! > 0) bb.chargeSum += pt.bess!;
+          if (pt.bess! < 0) bb.dischargeSum += pt.bess!;
+          bb.powerCount++;
+        }
+      }
+
+      if (timeline.has(sourceTs)) {
+        const b = timeline.get(sourceTs);
+        if (pt.soc !== undefined && pt.soc !== null && Number.isFinite(pt.soc)) {
+          b.socSum += pt.soc;
+          b.socCount++;
         }
       }
     });
@@ -129,8 +176,8 @@ export const BessChargeDischargeChart = ({
         if (b.powerCount > 0) {
           const avgSourceCharge = b.chargeSum / b.powerCount;
           const avgSourceDischarge = b.dischargeSum / b.powerCount;
-          sourceCharge = avgSourceCharge > 0 ? avgSourceCharge : null;
-          sourceDischarge = avgSourceDischarge < 0 ? avgSourceDischarge : null;
+          sourceCharge = avgSourceCharge > 0 ? avgSourceCharge / factor : null;
+          sourceDischarge = avgSourceDischarge < 0 ? avgSourceDischarge / factor : null;
         }
         
         // Low-res 10-minute display data (placed exactly at the 10-min boundaries)
@@ -141,8 +188,8 @@ export const BessChargeDischargeChart = ({
           if (bb.powerCount > 0) {
             const avgCharge = bb.chargeSum / bb.powerCount;
             const avgDischarge = bb.dischargeSum / bb.powerCount;
-            charge = avgCharge > 0 ? avgCharge : null;
-            discharge = avgDischarge < 0 ? avgDischarge : null;
+            charge = avgCharge > 0 ? avgCharge / factor : null;
+            discharge = avgDischarge < 0 ? avgDischarge / factor : null;
           }
         }
         
@@ -156,7 +203,7 @@ export const BessChargeDischargeChart = ({
         };
       })
       .sort((a, b) => a.timestamp - b.timestamp);
-  }, [data, domain]);
+  }, [data, domain, isMW]);
 
   const durationMs = domain[1] - domain[0];
   const durationHours = durationMs / (1000 * 60 * 60);
@@ -174,13 +221,8 @@ export const BessChargeDischargeChart = ({
   }
 
   const xTicks = [];
-  const start = new Date(domain[0]);
-  start.setMinutes(0, 0, 0);
-  if (start.getTime() < domain[0]) {
-    start.setHours(start.getHours() + 1);
-  }
-  
-  for (let t = start.getTime(); t <= domain[1]; t += tickIntervalHours * 60 * 60 * 1000) {
+  const startTs = getNextHourInTz(domain[0], timeZone);
+  for (let t = startTs; t <= domain[1]; t += tickIntervalHours * 60 * 60 * 1000) {
     xTicks.push(t);
   }
 
@@ -220,17 +262,21 @@ export const BessChargeDischargeChart = ({
                   tickFormatter={(val) => {
                     const d = new Date(val);
                     if (durationDays > 7) {
-                      return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+                      return formatDateCustom(d, dateFormat, timeZone);
                     } else if (durationDays > 2) {
-                      return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                      return formatDateTimeCustom(d, dateFormat, timeFormat, false, timeZone);
                     } else if (durationHours <= 26) {
-                      const hours = d.getHours();
+                      const parts = getDateParts(d, timeZone);
+                      if (timeFormat === '24h') {
+                        return `${parts.hours24.toString().padStart(2, '0')}:00`;
+                      }
+                      const hours = parts.hours24;
                       const ampm = hours >= 12 ? 'PM' : 'AM';
                       const hour12 = hours % 12 || 12;
                       const paddedHour = hour12 < 10 ? `0${hour12}` : hour12;
                       return `${paddedHour} ${ampm}`;
                     }
-                    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    return formatTimeCustom(d, timeFormat, false, timeZone);
                   }}
                   interval={durationHours <= 26 ? 0 : "preserveEnd"}
                   minTickGap={durationHours <= 26 ? 0 : 30}
@@ -246,15 +292,23 @@ export const BessChargeDischargeChart = ({
                 />
                 
                 <YAxis
-                  label={{ value: 'Power (kW)', angle: 0, position: 'top', offset: 15, fill: '#64748b', fontSize: 12 }}
+                  label={{ value: isMW ? 'Power (MW)' : 'Power (kW)', angle: 0, position: 'top', offset: 15, fill: '#64748b', fontSize: 12 }}
                   tick={{ fill: '#64748b', fontSize: 12 }}
                   axisLine={false}
                   tickLine={false}
-                  tickFormatter={(value) => `${value}`}
-                  width={50}
+                  tickFormatter={(value) => `${Number(Number(value).toFixed(2))}`}
+                  width={isMW ? 55 : 50}
                   domain={([dataMin, dataMax]: any) => {
                     const min = Math.min(dataMin || 0, 0);
                     const max = Math.max(dataMax || 0, 0);
+                    if (isMW) {
+                      const maxAbs = Math.max(Math.abs(min), Math.abs(max));
+                      const step = maxAbs > 1 ? 0.5 : maxAbs > 0.1 ? 0.05 : 0.01;
+                      const roundDown = -Math.ceil(Math.abs(min) / step) * step;
+                      const roundUp = Math.ceil(max / step) * step;
+                      const minPositiveBound = 0.05;
+                      return [Number(roundDown.toFixed(2)), Number(Math.max(roundUp, minPositiveBound).toFixed(2))];
+                    }
                     const roundDown = Math.floor(min / 50) * 50;
                     const roundUp = Math.ceil(max / 50) * 50;
                     return [roundDown, Math.max(roundUp, 50)];
@@ -273,7 +327,18 @@ export const BessChargeDischargeChart = ({
                   width={40}
                 />
                 
-                <Tooltip content={<CustomTooltip />} cursor={{ fill: '#f1f5f9' }} />
+                <Tooltip
+                  content={
+                    <CustomTooltip
+                      isMW={isMW}
+                      timeFormat={timeFormat}
+                      dateFormat={dateFormat}
+                      durationHours={durationHours}
+                      timeZone={timeZone}
+                    />
+                  }
+                  cursor={{ fill: '#f1f5f9' }}
+                />
                 
                 <Legend 
                   verticalAlign="top" 

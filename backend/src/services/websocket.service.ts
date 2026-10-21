@@ -37,13 +37,16 @@ export interface LiveTelemetryPayload {
     phaseACurrent?: number;
     phaseBCurrent?: number;
     phaseCCurrent?: number;
-    // BMS — not populated in Phase 14C (bcms absent from live payload)
+    // BMS (Phase 2 BMS Telemetry Table)
     bessSoc?: number;
     bmsSoh?: number;
     bmsCurrent?: number;
     cellVMax?: number;
     cellVMin?: number;
     cellTempMax?: number;
+    cellTempMin?: number;        // bcms.ai_min_temp
+    bmsDcVoltage?: number;       // bcms.ai_sum_u
+    bmsCabinetState?: number;    // bcms.di_rcdhg_stat (0=STANDBY, 1=DISCHARGING, 2=CHARGING)
     // Solar PV Inverter (pinv component — Step 1)
     solarPower?: number;          // pinv.ai_op_p
     solarFrequency?: number;      // pinv.ai_freq
@@ -51,6 +54,22 @@ export interface LiveTelemetryPayload {
     // Cabinet Frequency and Power Factor
     bessFrequency?: number;       // pcs.ai_freq
     bessPowerFactor?: number;     // pcs.ai_cos → BESS/PCS Power Factor
+    bessPowerFactorMeasuredAt?: string;
+    // Battery Status & Ambient
+    batteryAmbientTemp?: number;  // th.ai_temp
+    packAvgTemp?: number;         // pack_* average temperature
+    packMaxTemp?: number;         // pack_* maximum temperature
+    // PCS Telemetry Table (Phase 1) & TMS Ambient Temp
+    pcsTemperature?: number;      // pcs.ai_igbt_temp
+    pcsLineVoltage?: number;      // pcs avg(ai_out_uab, ai_out_ubc, ai_out_uca)
+    pcsAcCurrent?: number;        // pcs avg(ai_ia, ai_ib, ai_ic)
+    tmsAmbientTemp?: number;      // tms.ai_at
+    // TMS Telemetry Table
+    tmsOperatingMode?: number;         // tms.di_singco_state
+    tmsCoolantReturnTemp?: number;     // tms.ai_iw_temp (°C)
+    tmsCoolantInletTemp?: number;      // tms.ai_ow_temp (°C)
+    tmsCoolantReturnPressure?: number; // tms.ai_iw_prs (bar)
+    tmsCoolantInletPressure?: number;  // tms.ai_ow_prs (bar)
     // loadPower and energyToday reserved for future use
     loadPower?: number;
     energyToday?: number;
@@ -99,7 +118,10 @@ export class WebSocketService {
       }
       try {
         const decoded = authService.verifyToken(token);
-        (socket as any).user = decoded; // Store userId, email, role
+        if (decoded.exp && (decoded.exp * 1000) <= Date.now()) {
+          return next(new Error('AUTH_REQUIRED'));
+        }
+        (socket as any).user = decoded; // Store userId, email, role, exp
         next();
       } catch (err) {
         return next(new Error('AUTH_REQUIRED'));
@@ -108,7 +130,26 @@ export class WebSocketService {
 
     this.io.on('connection', (socket: Socket) => {
       const user = (socket as any).user;
-      console.log(`[WebSocket] Client connected: ${socket.id} (User: ${user.userId})`);
+      console.log(`[WebSocket] Client connected: ${socket.id} (User: ${user?.userId})`);
+
+      // Server-side session expiry enforcement
+      let expiryTimer: NodeJS.Timeout | null = null;
+      if (user?.exp) {
+        const remainingMs = (user.exp * 1000) - Date.now();
+        if (remainingMs <= 0) {
+          socket.emit('error', { message: 'Session expired' });
+          socket.disconnect(true);
+          return;
+        }
+
+        expiryTimer = setTimeout(() => {
+          if (socket.connected) {
+            console.log(`[WebSocket] Session expired for socket ${socket.id} (User: ${user.userId}). Disconnecting.`);
+            socket.emit('error', { message: 'Session expired' });
+            socket.disconnect(true);
+          }
+        }, remainingMs);
+      }
 
       socket.on('subscribe', async (payload: { siteId: string }) => {
         const { siteId } = payload;
@@ -152,6 +193,10 @@ export class WebSocketService {
       });
 
       socket.on('disconnect', () => {
+        if (expiryTimer) {
+          clearTimeout(expiryTimer);
+          expiryTimer = null;
+        }
         console.log(`[WebSocket] Client disconnected: ${socket.id}`);
       });
     });

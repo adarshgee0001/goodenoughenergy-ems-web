@@ -1,4 +1,8 @@
 import { prisma } from '../db/prisma';
+import { processReportBatteryStatusRow } from '../utils/battery-status.util';
+import { processReportPcsRow } from '../utils/pcs-telemetry.util';
+import { processReportBmsRow } from '../utils/bms-telemetry.util';
+import { processReportTmsRow } from '../utils/tms-telemetry.util';
 
 export class DynamicReportService {
   public async getDynamicReport(
@@ -10,7 +14,7 @@ export class DynamicReportService {
     limit: number,
     offset: number
   ) {
-    const intervalStr = `${intervalMinutes} minutes`;
+    const intervalStr = `${intervalMinutes || 15} minutes`;
     
     let bessAssetFilter = `d."bessAssetId" IN (SELECT "id" FROM "BESSAsset" WHERE "siteId" = '${siteId}')`;
     if (bessAssetId) {
@@ -30,7 +34,7 @@ export class DynamicReportService {
       JOIN "Device" d ON th."deviceId" = d."id"
       JOIN "BESSAsset" b ON d."bessAssetId" = b."id"
       WHERE ${bessAssetFilter} AND ${timeFilter}
-      GROUP BY d."bessAssetId", b."emuId", date_bin('${intervalStr}'::interval, th."timestamp", '2000-01-01 00:00:00Z')
+      GROUP BY d."bessAssetId", b."name", b."emuId", date_bin('${intervalStr}'::interval, th."timestamp", '2000-01-01 00:00:00Z')
     `;
 
     const countQuery = `
@@ -44,6 +48,7 @@ export class DynamicReportService {
     const dataQuery = `
       SELECT
         d."bessAssetId",
+        b."name" AS "bessName",
         b."emuId" AS "emuId",
         date_bin('${intervalStr}'::interval, th."timestamp", '2000-01-01 00:00:00Z') AS "bucketTimestamp",
         AVG(th."voltageA") AS "voltageA",
@@ -71,7 +76,100 @@ export class DynamicReportService {
         (array_agg(th."accumChargeEnergy" ORDER BY th."timestamp" DESC) FILTER (WHERE th."accumChargeEnergy" IS NOT NULL))[1] AS "accumChargeEnergy",
         (array_agg(th."accumDischargeEnergy" ORDER BY th."timestamp" DESC) FILTER (WHERE th."accumDischargeEnergy" IS NOT NULL))[1] AS "accumDischargeEnergy",
         (array_agg(th."soc" ORDER BY th."timestamp" DESC) FILTER (WHERE th."soc" IS NOT NULL))[1] AS "soc",
-        (array_agg(th."soh" ORDER BY th."timestamp" DESC) FILTER (WHERE th."soh" IS NOT NULL))[1] AS "soh"
+        (array_agg(th."soh" ORDER BY th."timestamp" DESC) FILTER (WHERE th."soh" IS NOT NULL))[1] AS "soh",
+        AVG(CASE WHEN d."componentId" = 'th' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+          (SELECT (elem->>'v')::double precision
+           FROM jsonb_array_elements(th."rawPayload") elem
+           WHERE elem->>'m' = 'ai_temp' AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$' LIMIT 1)
+        END) AS "batteryAmbientTemp",
+        (array_agg(th."rawPayload" ORDER BY th."timestamp" DESC) FILTER (WHERE d."componentId" = 'pack_01' AND th."rawPayload" IS NOT NULL)) AS "pack01Payloads",
+        (array_agg(th."rawPayload" ORDER BY th."timestamp" DESC) FILTER (WHERE d."componentId" = 'pack_02' AND th."rawPayload" IS NOT NULL)) AS "pack02Payloads",
+        (array_agg(th."rawPayload" ORDER BY th."timestamp" DESC) FILTER (WHERE d."componentId" = 'pack_03' AND th."rawPayload" IS NOT NULL)) AS "pack03Payloads",
+        (array_agg(th."rawPayload" ORDER BY th."timestamp" DESC) FILTER (WHERE d."componentId" = 'pack_04' AND th."rawPayload" IS NOT NULL)) AS "pack04Payloads",
+        (array_agg(th."rawPayload" ORDER BY th."timestamp" DESC) FILTER (WHERE d."componentId" = 'pack_05' AND th."rawPayload" IS NOT NULL)) AS "pack05Payloads",
+        AVG(CASE WHEN d."componentId" = 'pcs' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+          (SELECT (elem->>'v')::double precision
+           FROM jsonb_array_elements(th."rawPayload") elem
+           WHERE elem->>'m' = 'ai_igbt_temp' AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$' LIMIT 1)
+        END) AS "pcsTemperature",
+        AVG(CASE WHEN d."componentId" = 'pcs'
+                 AND th."bessVoltageUa" IS NOT NULL
+                 AND th."bessVoltageUb" IS NOT NULL
+                 AND th."bessVoltageUc" IS NOT NULL
+            THEN (th."bessVoltageUa" + th."bessVoltageUb" + th."bessVoltageUc") / 3.0
+            WHEN d."componentId" = 'pcs' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+              (SELECT CASE WHEN count(*) = 3 THEN avg((elem->>'v')::double precision) END
+               FROM jsonb_array_elements(th."rawPayload") elem
+               WHERE elem->>'m' IN ('ai_out_uab', 'ai_out_ubc', 'ai_out_uca') AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$')
+        END) AS "pcsLineVoltage",
+        AVG(CASE WHEN d."componentId" = 'pcs' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+          (SELECT CASE WHEN count(*) = 3 THEN avg((elem->>'v')::double precision) END
+           FROM jsonb_array_elements(th."rawPayload") elem
+           WHERE elem->>'m' IN ('ai_ia', 'ai_ib', 'ai_ic') AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$')
+        END) AS "pcsAcCurrent",
+        AVG(CASE WHEN d."componentId" = 'tms' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+          (SELECT (elem->>'v')::double precision
+           FROM jsonb_array_elements(th."rawPayload") elem
+           WHERE elem->>'m' = 'ai_at' AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$' LIMIT 1)
+        END) AS "tmsAmbientTemp",
+        (array_agg(
+          CASE WHEN d."componentId" = 'tms' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+            (SELECT (elem->>'v')::integer
+             FROM jsonb_array_elements(th."rawPayload") elem
+             WHERE elem->>'m' = 'di_singco_state' AND elem->>'v' ~ '^[0-4]$' LIMIT 1)
+          END
+          ORDER BY th."timestamp" DESC
+        ) FILTER (
+          WHERE d."componentId" = 'tms' AND jsonb_typeof(th."rawPayload") = 'array' AND
+          EXISTS (
+            SELECT 1 FROM jsonb_array_elements(th."rawPayload") elem
+            WHERE elem->>'m' = 'di_singco_state' AND elem->>'v' ~ '^[0-4]$'
+          )
+        ))[1] AS "tmsOperatingMode",
+        AVG(CASE WHEN d."componentId" = 'tms' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+          (SELECT (elem->>'v')::double precision
+           FROM jsonb_array_elements(th."rawPayload") elem
+           WHERE elem->>'m' = 'ai_iw_temp' AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$' LIMIT 1)
+        END) AS "tmsCoolantReturnTemp",
+        AVG(CASE WHEN d."componentId" = 'tms' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+          (SELECT (elem->>'v')::double precision
+           FROM jsonb_array_elements(th."rawPayload") elem
+           WHERE elem->>'m' = 'ai_ow_temp' AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$' LIMIT 1)
+        END) AS "tmsCoolantInletTemp",
+        AVG(CASE WHEN d."componentId" = 'tms' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+          (SELECT (elem->>'v')::double precision
+           FROM jsonb_array_elements(th."rawPayload") elem
+           WHERE elem->>'m' = 'ai_iw_prs' AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$' LIMIT 1)
+        END) AS "tmsCoolantReturnPressure",
+        AVG(CASE WHEN d."componentId" = 'tms' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+          (SELECT (elem->>'v')::double precision
+           FROM jsonb_array_elements(th."rawPayload") elem
+           WHERE elem->>'m' = 'ai_ow_prs' AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$' LIMIT 1)
+        END) AS "tmsCoolantInletPressure",
+        AVG(CASE WHEN d."componentId" = 'bcms' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+          (SELECT (elem->>'v')::double precision
+           FROM jsonb_array_elements(th."rawPayload") elem
+           WHERE elem->>'m' = 'ai_sum_u' AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$' LIMIT 1)
+        END) AS "bmsDcVoltage",
+        MIN(CASE WHEN d."componentId" = 'bcms' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+          (SELECT (elem->>'v')::double precision
+           FROM jsonb_array_elements(th."rawPayload") elem
+           WHERE elem->>'m' = 'ai_min_temp' AND elem->>'v' ~ '^-?[0-9]+(\.[0-9]+)?$' LIMIT 1)
+        END) AS "cellTempMin",
+        (array_agg(
+          CASE WHEN d."componentId" = 'bcms' AND jsonb_typeof(th."rawPayload") = 'array' THEN
+            (SELECT (elem->>'v')::integer
+             FROM jsonb_array_elements(th."rawPayload") elem
+             WHERE elem->>'m' = 'di_rcdhg_stat' AND elem->>'v' ~ '^[0-2]$' LIMIT 1)
+          END
+          ORDER BY th."timestamp" DESC
+        ) FILTER (
+          WHERE d."componentId" = 'bcms' AND jsonb_typeof(th."rawPayload") = 'array' AND
+          EXISTS (
+            SELECT 1 FROM jsonb_array_elements(th."rawPayload") elem
+            WHERE elem->>'m' = 'di_rcdhg_stat' AND elem->>'v' ~ '^[0-2]$'
+          )
+        ))[1] AS "bmsCabinetState"
       ${baseQuery}
       ORDER BY "bucketTimestamp" DESC
       LIMIT ${limit} OFFSET ${offset}
@@ -81,6 +179,13 @@ export class DynamicReportService {
     const total = countResult[0]?.total || 0;
 
     const snapshots: any[] = await prisma.$queryRawUnsafe(dataQuery);
+
+    for (const row of snapshots) {
+      processReportBatteryStatusRow(row);
+      processReportPcsRow(row);
+      processReportBmsRow(row);
+      processReportTmsRow(row);
+    }
 
     let summary = null;
     if (from || to) {

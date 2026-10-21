@@ -1,12 +1,18 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Outlet, useNavigate } from 'react-router-dom';
 import { EMSSidebar } from '../components/navigation/EMSSidebar';
 import { EMSHeader } from '../components/navigation/EMSHeader';
 import { usePreview } from '../context/PreviewContext';
+import { useAuth } from '../hooks/useAuth';
+import { useWebSocket } from '../context/WebSocketContext';
+import { dashboardService } from '../features/dashboard/dashboard.service';
+import type { DashboardContext } from '../features/dashboard/dashboard.types';
 
 export function EMSLayout() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const { isPreviewing, previewClientName, exitPreview } = usePreview();
+  const { isPreviewing, previewClientId, previewClientName, exitPreview } = usePreview();
+  const { role } = useAuth();
+  const { subscribeToSite, unsubscribeFromSite, isConnected } = useWebSocket();
   const navigate = useNavigate();
 
   const toggleSidebar = () => setIsSidebarOpen(!isSidebarOpen);
@@ -16,6 +22,41 @@ export function EMSLayout() {
     exitPreview();
     navigate('/admin/clients', { replace: true });
   };
+
+  // Maintain continuous authorized site alarm subscription across all EMS subpages
+  useEffect(() => {
+    let cancelled = false;
+    let activeSubscribedSiteId: string | null = null;
+
+    async function subscribeFacilityAlarms() {
+      try {
+        let ctx: DashboardContext;
+        if (role === 'ADMIN' && isPreviewing && previewClientId) {
+          ctx = await dashboardService.resolvePreviewContext(previewClientId);
+        } else {
+          ctx = await dashboardService.resolveClientContext();
+        }
+
+        if (!cancelled && ctx?.site?.id) {
+          activeSubscribedSiteId = ctx.site.id;
+          subscribeToSite(ctx.site.id);
+        }
+      } catch (err) {
+        console.warn('[EMSLayout] Could not resolve site context for continuous alarms:', err);
+      }
+    }
+
+    if (isConnected) {
+      subscribeFacilityAlarms();
+    }
+
+    return () => {
+      cancelled = true;
+      if (activeSubscribedSiteId) {
+        unsubscribeFromSite(activeSubscribedSiteId);
+      }
+    };
+  }, [role, isPreviewing, previewClientId, isConnected, subscribeToSite, unsubscribeFromSite]);
 
   return (
     <div className="flex h-screen overflow-hidden bg-slate-50 font-sans">
@@ -29,7 +70,7 @@ export function EMSLayout() {
             </div>
             <button
               onClick={handleExitPreview}
-              className="text-xs font-semibold bg-indigo-500 hover:bg-indigo-400 text-white px-3 py-1 rounded transition-colors"
+              className="text-xs font-semibold bg-indigo-500 hover:bg-indigo-400 text-white px-3 py-1 rounded transition-colors duration-150 ease-out focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-white"
             >
               Exit Preview
             </button>
