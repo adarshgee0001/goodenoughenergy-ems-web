@@ -1,10 +1,45 @@
 import { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { dashboardService } from '../../features/dashboard/dashboard.service';
-import type { DashboardSite, DashboardBessAsset, DashboardDevice, DashboardTelemetryState } from '../../features/dashboard/dashboard.types';
+import type { DashboardSite, DashboardBessAsset, DashboardDevice, DashboardTelemetryState, LatestTelemetryRow } from '../../features/dashboard/dashboard.types';
 import { BatteryMedium, Activity, Zap, ChevronRight, ChevronLeft, Cpu, Loader2, AlertCircle } from 'lucide-react';
 import { useUserSettings } from '../../features/settings/hooks/useUserSettings';
 import { KPICard } from './components/EMSKPICard';
+
+/**
+ * Merges latest telemetry rows for a specific BESS asset into a single unified telemetry state.
+ * Specifically selects the authoritative PCS row by its canonical componentId ('pcs')
+ * and the authoritative BMS row by its canonical componentId ('bcms').
+ */
+export function mergeAssetTelemetryRows(
+  telemetryRows: LatestTelemetryRow[],
+  assetId: string
+): DashboardTelemetryState {
+  const merged: DashboardTelemetryState = {};
+  const assetTelemetryRows = telemetryRows.filter(row => row.device.bessAssetId === assetId);
+  for (const row of assetTelemetryRows) {
+    if (row.device.componentId === 'pcs') {
+      merged.bessPower = row.pcsActivePower ?? undefined;
+      merged.pcsDcVoltage = row.dcVoltage ?? undefined;
+      merged.pcsTemp = row.ambientTemp ?? undefined;
+      merged.todayChargeEnergy = row.todayChargeEnergy ?? undefined;
+      merged.todayDischargeEnergy = row.todayDischargeEnergy ?? undefined;
+      merged.accChargeEnergy = row.accumChargeEnergy ?? undefined;
+      merged.accDischargeEnergy = row.accumDischargeEnergy ?? undefined;
+      merged.powerFactor = row.powerFactor ?? undefined;
+      merged.bessPowerFactor = row.bessPowerFactor ?? undefined;
+    }
+    if (row.device.componentId === 'bcms') {
+      merged.bessSoc = row.soc ?? undefined;
+      merged.bmsSoh = row.soh ?? undefined;
+      merged.bmsCurrent = row.bmsCurrent ?? undefined;
+      merged.cellVMax = row.cellVMax ?? undefined;
+      merged.cellVMin = row.cellVMin ?? undefined;
+      merged.cellTempMax = row.cellTempMax ?? undefined;
+    }
+  }
+  return merged;
+}
 
 export default function BESSAssetDetailsPage() {
   const { assetId } = useParams<{ assetId: string }>();
@@ -42,30 +77,7 @@ export default function BESSAssetDetailsPage() {
         try {
           const telemetryRows = await dashboardService.getLatestTelemetry(fetchedSite.id);
           if (telemetryRows && telemetryRows.length > 0) {
-            // Merge rows into a single telemetry state
-            let merged: DashboardTelemetryState = {};
-            const assetTelemetryRows = telemetryRows.filter(row => row.device.bessAssetId === assetId);
-            for (const row of assetTelemetryRows) {
-              if (row.device.type === 'PCS') {
-                merged.bessPower = row.pcsActivePower ?? undefined;
-                merged.pcsDcVoltage = row.dcVoltage ?? undefined;
-                merged.pcsTemp = row.ambientTemp ?? undefined;
-                merged.todayChargeEnergy = row.todayChargeEnergy ?? undefined;
-                merged.todayDischargeEnergy = row.todayDischargeEnergy ?? undefined;
-                merged.accChargeEnergy = row.accumChargeEnergy ?? undefined;
-                merged.accDischargeEnergy = row.accumDischargeEnergy ?? undefined;
-                merged.powerFactor = row.powerFactor ?? undefined;
-                merged.bessPowerFactor = row.bessPowerFactor ?? undefined;
-              }
-              if (row.device.componentId === 'bcms') {
-                merged.bessSoc = row.soc ?? undefined;
-                merged.bmsSoh = row.soh ?? undefined;
-                merged.bmsCurrent = row.bmsCurrent ?? undefined;
-                merged.cellVMax = row.cellVMax ?? undefined;
-                merged.cellVMin = row.cellVMin ?? undefined;
-                merged.cellTempMax = row.cellTempMax ?? undefined;
-              }
-            }
+            const merged = mergeAssetTelemetryRows(telemetryRows, assetId);
             setTelemetry(merged);
           }
         } catch (telemetryErr) {
