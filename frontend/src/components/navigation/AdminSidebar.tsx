@@ -25,7 +25,7 @@ export function AdminSidebar({ isOpen, closeSidebar }: { isOpen: boolean; closeS
       `}>
         <div className="h-16 flex items-center px-6 border-b border-slate-800 shrink-0 gap-3">
           <img
-            src="/Favgee.png"
+            src="/Favgee.png?v=2"
             alt="GoodEnough Energy Logo"
             className="h-7 w-auto object-contain shrink-0"
           />

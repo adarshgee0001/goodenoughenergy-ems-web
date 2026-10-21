@@ -59,7 +59,7 @@ export default function LoginPage() {
       <div className="max-w-md w-full relative z-10 space-y-8 bg-white p-10 rounded-3xl shadow-2xl">
         <div className="text-center">
           <img
-            src="/Favgee.png"
+            src="/Favgee.png?v=2"
             alt="GoodEnough Energy Logo"
             className="mx-auto h-12 w-auto object-contain mb-3"
           />

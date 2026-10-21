@@ -27,7 +27,7 @@ export function EMSHeader({ toggleSidebar }: { toggleSidebar: () => void }) {
         </button>
         <div className="flex items-center gap-2.5">
           <img
-            src="/Favgee.png"
+            src="/Favgee.png?v=2"
             alt="GoodEnough Energy Logo"
             className="h-8 w-auto object-contain shrink-0"
           />

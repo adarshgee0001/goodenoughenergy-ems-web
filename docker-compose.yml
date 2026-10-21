@@ -37,6 +37,13 @@ services:
       ADMIN_NAME: ${ADMIN_NAME:-Admin}
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@gee.local}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin@321}
+      MQTT_BROKER_URL: ${MQTT_BROKER_URL:-mqtts://a78dc6627ffa4d10a67ad441b415f980.s1.eu.hivemq.cloud}
+      MQTT_PORT: ${MQTT_PORT:-8883}
+      MQTT_USERNAME: ${MQTT_USERNAME:-adarshyadav}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-@adarsh!!}
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-ems_backend_telemetry_a}
+      MQTT_PROTOCOL: ${MQTT_PROTOCOL:-mqtts}
+      MQTT_TOPIC: ${MQTT_TOPIC:-/adarsh07786/0QQSB03PY21106F680100007/user/rtg}
     depends_on:
       postgres:
         condition: service_healthy
