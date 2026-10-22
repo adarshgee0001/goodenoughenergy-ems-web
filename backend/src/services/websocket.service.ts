@@ -86,13 +86,28 @@ export class WebSocketService {
   private io: SocketIOServer | null = null;
 
   public initialize(httpServer: HttpServer) {
-    const allowedOrigins = process.env.CORS_ORIGIN 
-      ? process.env.CORS_ORIGIN.split(',') 
-      : ['http://localhost:5173'];
+    const configuredOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173,http://localhost:3000,http://localhost:80,http://storedge.goodenough.energy,http://10.10.10.245:5173,http://10.10.10.245:5000')
+      .split(',')
+      .map(o => o.trim())
+      .filter(Boolean);
+
+    const isAllowedOrigin = (origin: string | undefined): boolean => {
+      if (!origin) return true;
+      if (configuredOrigins.includes(origin)) return true;
+      if (/^https?:\/\/(localhost|127\.0\.0\.1|10\.10\.10\.245)(:\d+)?$/.test(origin)) return true;
+      if (/^https?:\/\/([a-z0-9-]+\.)*goodenough\.energy(:\d+)?$/.test(origin)) return true;
+      return false;
+    };
 
     this.io = new SocketIOServer(httpServer, {
       cors: {
-        origin: allowedOrigins,
+        origin: (origin, callback) => {
+          if (isAllowedOrigin(origin)) {
+            callback(null, true);
+          } else {
+            callback(null, false);
+          }
+        },
         methods: ['GET', 'POST'],
         credentials: true
       }

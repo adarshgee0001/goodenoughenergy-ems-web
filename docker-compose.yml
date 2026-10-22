@@ -53,10 +53,10 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # Staging URL
-        VITE_API_URL: http://10.10.10.245:5000
         # Production URL
-        # VITE_API_URL: http://storedge.goodenough.energy
+        VITE_API_URL: http://storedge.goodenough.energy
+        # Staging URL
+        # VITE_API_URL: http://10.10.10.245:5000
         # Local development
         # VITE_API_URL: http://localhost:5000
     container_name: ems-frontend

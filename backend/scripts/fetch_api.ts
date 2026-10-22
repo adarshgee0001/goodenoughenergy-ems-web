@@ -3,7 +3,8 @@ import path from 'path';
 const ExcelJS = require('exceljs');
 
 async function main() {
-  const loginRes = await fetch('http://10.10.10.245:5000/api/auth/login', {
+  const baseUrl = 'http://storedge.goodenough.energy';
+  const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: 'admin@gee.local', password: 'admin@321' })
@@ -15,7 +16,7 @@ async function main() {
   const end = '2026-10-10T03:35:00.000Z';
 
   // Test Excel Export
-  const url = `http://localhost:5000/api/bess/${assetId}/voltage-trend/export?from=${start}&to=${end}`;
+  const url = `${baseUrl}/api/bess/${assetId}/voltage-trend/export?from=${start}&to=${end}`;
   const res = await fetch(url, { headers: { 'Cookie': cookie || '' } });
   
   const destPath = path.join(__dirname, 'test-export.xlsx');

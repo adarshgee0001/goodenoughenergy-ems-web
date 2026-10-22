@@ -11,7 +11,7 @@ const app = express();
 // Middlewares
 // Middlewares
 // CORS configuration allows configured origins, local network (10.10.10.245), localhost, and goodenough.energy domains
-const configuredOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173,http://localhost:3000,http://10.10.10.245:5173,http://10.10.10.245:5000')
+const configuredOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173,http://localhost:3000,http://storedge.goodenough.energy,http://10.10.10.245:5173,http://10.10.10.245:5000')
   .split(',')
   .map(o => o.trim())
   .filter(Boolean);
