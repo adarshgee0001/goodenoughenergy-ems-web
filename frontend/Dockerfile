@@ -7,8 +7,12 @@ RUN npm ci
 
 COPY . .
 
-ARG VITE_API_URL=http://localhost:5000
+# Production: http://storedge.goodenough.energy
+# Staging: http://10.10.10.245:5000
+# Local: http://localhost:5000
+ARG VITE_API_URL=http://storedge.goodenough.energy
 ENV VITE_API_URL=${VITE_API_URL}
+
 
 RUN npm run build
 
