@@ -31,7 +31,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-EmsDev2026!Pg}@postgres:5432/${POSTGRES_DB:-ems}?schema=public
       JWT_SECRET: ${JWT_SECRET:-90b68a2bc0a3ed38586290da5cc0de6b9c13dccd6e8fc92621bbd5ab0fa73eb5}
       JWT_EXPIRES_IN: 1d
-      CORS_ORIGIN: http://localhost:5173,http://localhost:3000,http://localhost:80,http://storedge.goodenough.energy,http://10.10.10.245:5000
+      CORS_ORIGIN: http://localhost:5173,http://localhost:3000,http://localhost:80,http://storedge.goodenough.energy,http://10.10.10.245:5000,http://10.10.10.245:5173
       DB_HOST: postgres
       DB_PORT: 5432
       ADMIN_NAME: ${ADMIN_NAME:-Admin}
@@ -53,10 +53,10 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        # Production URL
-        VITE_API_URL: http://storedge.goodenough.energy
         # Staging URL
-        # VITE_API_URL: http://10.10.10.245:5000
+        VITE_API_URL: http://10.10.10.245:5000
+        # Production URL
+        # VITE_API_URL: http://storedge.goodenough.energy
         # Local development
         # VITE_API_URL: http://localhost:5000
     container_name: ems-frontend

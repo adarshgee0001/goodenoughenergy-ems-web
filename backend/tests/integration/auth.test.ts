@@ -58,13 +58,13 @@ describe('test-auth.ts', () => {
     });
     let data = await res.json();
     const setCookieHeader = res.headers.get('set-cookie') || '';
-    assert(res.status === 200 && data.success === true && !data.token, 'valid login');
+    assert(res.status === 200 && data.success === true && !!data.token, 'valid login returns token');
     assert(setCookieHeader.includes('auth_token='), 'valid login sets auth_token cookie');
     assert(setCookieHeader.includes('HttpOnly'), 'auth_token cookie is HttpOnly');
     
-    // Extract token from cookie string for subsequent tests
+    // Extract token from cookie string or response payload for subsequent tests
     const cookieMatch = setCookieHeader.match(/auth_token=([^;]+)/);
-    const validToken = cookieMatch ? cookieMatch[1] : '';
+    const validToken = data.token || (cookieMatch ? cookieMatch[1] : '');
 
     res = await fetch(`${baseUrl}/login`, {
       method: 'POST',
@@ -97,6 +97,14 @@ describe('test-auth.ts', () => {
     data = await res.json();
     assert(res.status === 200 && data.success === true && data.user.email === 'test@example.com', 'valid cookie on /me');
 
+    // Test Authorization Bearer header
+    res = await fetch(`${baseUrl}/me`, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${validToken}` }
+    });
+    data = await res.json();
+    assert(res.status === 200 && data.success === true && data.user.email === 'test@example.com' && !!data.token, 'valid Authorization Bearer header on /me');
+
     res = await fetch(`${baseUrl}/me`, {
       method: 'GET'
     });
@@ -109,6 +117,13 @@ describe('test-auth.ts', () => {
     });
     data = await res.json();
     assert(res.status === 401 && data.success === false, 'invalid JWT cookie');
+
+    res = await fetch(`${baseUrl}/me`, {
+      method: 'GET',
+      headers: { 'Authorization': 'Bearer invalid_token_xyz' }
+    });
+    data = await res.json();
+    assert(res.status === 401 && data.success === false, 'invalid Authorization header');
 
   } finally {
     server.close();

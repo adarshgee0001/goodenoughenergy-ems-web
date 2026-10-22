@@ -2,6 +2,7 @@ import { API_BASE } from '../utils/apiClient';
 import React, { createContext, useContext, useEffect, useState, type ReactNode, useRef, useMemo, useCallback } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { useAuth } from '../hooks/useAuth';
+import { authStorage } from '../features/auth/auth.storage';
 import { useUserSettings } from '../features/settings/hooks/useUserSettings';
 import { alarmAudioNotifier } from '../features/settings/alarmAudio.utils';
 
@@ -92,8 +93,16 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
     // Fallback URL if env is missing; backend is expected at /api or similar port
     const socketUrl = API_BASE;
 
+    const token = authStorage.getToken();
+
     const newSocket = io(socketUrl, {
       withCredentials: true,
+      auth: {
+        token: token || undefined,
+      },
+      extraHeaders: token ? {
+        Authorization: `Bearer ${token}`,
+      } : undefined,
       autoConnect: true,
       reconnection: true,
       reconnectionDelay: 2000,

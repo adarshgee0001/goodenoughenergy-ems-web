@@ -17,12 +17,13 @@ declare global {
         role: string;
       };
       authExp?: number;
+      token?: string;
     }
   }
 }
 
 /**
- * Middleware to authenticate a user using a JWT token in the Authorization header.
+ * Middleware to authenticate a user using a JWT token in the Authorization header or cookie.
  */
 export const authenticateUser = async (
   req: Request,
@@ -30,22 +31,42 @@ export const authenticateUser = async (
   next: NextFunction
 ): Promise<void> => {
   try {
-    let token = req.cookies?.auth_token;
+    // Collect token candidates: prioritize Authorization header, fallback to cookie
+    const candidates: string[] = [];
 
-    if (!token) {
+    if (req.headers.authorization) {
+      const authHeader = req.headers.authorization;
+      const hToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : authHeader.trim();
+      if (hToken) candidates.push(hToken);
+    }
+
+    if (req.cookies?.auth_token) {
+      const cToken = req.cookies.auth_token.trim();
+      if (cToken) candidates.push(cToken);
+    }
+
+    if (candidates.length === 0) {
       res.status(401).json({ success: false, message: 'Authentication required' });
       return;
     }
-    
-    let decoded: JwtPayload;
-    try {
-      decoded = authService.verifyToken(token);
-    } catch (err) {
-      res.status(401).json({ success: false, message: 'Invalid or expired token' });
-      return;
+
+    let decoded: JwtPayload | null = null;
+    let validToken: string | undefined;
+
+    for (const cand of candidates) {
+      try {
+        const d = authService.verifyToken(cand);
+        if (!d.exp || (d.exp * 1000) > Date.now()) {
+          decoded = d;
+          validToken = cand;
+          break;
+        }
+      } catch {
+        // Try next candidate
+      }
     }
 
-    if (decoded.exp && (decoded.exp * 1000) <= Date.now()) {
+    if (!decoded || !validToken) {
       res.status(401).json({ success: false, message: 'Invalid or expired token' });
       return;
     }
@@ -68,6 +89,7 @@ export const authenticateUser = async (
 
     // Attach user to request context
     req.user = user;
+    req.token = validToken;
     req.authExp = decoded.exp ? decoded.exp * 1000 : undefined;
     next();
   } catch (error) {

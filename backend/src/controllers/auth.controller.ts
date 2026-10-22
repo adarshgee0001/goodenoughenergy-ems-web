@@ -63,9 +63,10 @@ export const login = async (req: Request, res: Response): Promise<void> => {
       clientId = access?.clientId;
     }
 
-    // Return safe user payload (no token)
+    // Return safe user payload and JWT token
     res.status(200).json({
       success: true,
+      token,
       user: {
         id: user.id,
         email: user.email,
@@ -101,6 +102,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
 
     res.status(200).json({
       success: true,
+      token: req.token,
       user: {
         ...req.user,
         forcePasswordChange: (await prisma.user.findUnique({ where: { id: req.user.id } }))?.forcePasswordChange,

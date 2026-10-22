@@ -100,18 +100,23 @@ export class WebSocketService {
 
     // Authentication Middleware
     this.io.use((socket, next) => {
-      const cookieHeader = socket.handshake.headers.cookie;
-      if (!cookieHeader) {
-        return next(new Error('AUTH_REQUIRED'));
+      let token: string | undefined;
+
+      if (socket.handshake.auth?.token) {
+        token = socket.handshake.auth.token;
+      } else if (socket.handshake.headers.authorization) {
+        const authHeader = socket.handshake.headers.authorization;
+        token = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : authHeader.trim();
+      } else if (socket.handshake.headers.cookie) {
+        const cookieHeader = socket.handshake.headers.cookie;
+        const cookies = Object.fromEntries(
+          cookieHeader.split(';').map(c => {
+            const [key, ...v] = c.split('=');
+            return [key.trim(), decodeURIComponent(v.join('='))];
+          })
+        );
+        token = cookies.auth_token;
       }
-      
-      const cookies = Object.fromEntries(
-        cookieHeader.split(';').map(c => {
-          const [key, ...v] = c.split('=');
-          return [key.trim(), decodeURIComponent(v.join('='))];
-        })
-      );
-      const token = cookies.auth_token;
       
       if (!token) {
         return next(new Error('AUTH_REQUIRED'));

@@ -77,11 +77,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       initialAuthRef.current.abort();
       initialAuthRef.current = null;
     }
-    const { user: authenticatedUser, expiresAt: tokenExpiresAt } = await authService.login(credentials);
+    const { user: authenticatedUser, token, expiresAt: tokenExpiresAt } = await authService.login(credentials);
     setUser(authenticatedUser);
     const deadline = tokenExpiresAt ?? null;
     setExpiresAt(deadline);
-    authStorage.setSession(authenticatedUser, tokenExpiresAt);
+    authStorage.setSession(authenticatedUser, tokenExpiresAt, token);
     if (tokenExpiresAt) {
       scheduleSessionExpiry(tokenExpiresAt);
     }
@@ -166,8 +166,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const controller = new AbortController();
     initialAuthRef.current = controller;
 
+    const token = authStorage.getToken();
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
     // Use native fetch to prevent a 401 here from triggering the global auth:expired listener
     fetch(`${API_BASE}/api/auth/me`, { 
+      headers,
       credentials: 'include',
       signal: controller.signal 
     }).then((res: Response) => {
@@ -176,8 +183,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           if (data.success && data.user) {
             setUser(data.user);
             const serverExpiresAt = typeof data.expiresAt === 'number' ? data.expiresAt : initialStored?.expiresAt;
+            const serverToken = data.token || token;
             setExpiresAt(serverExpiresAt ?? null);
-            authStorage.setSession(data.user, serverExpiresAt);
+            authStorage.setSession(data.user, serverExpiresAt, serverToken || undefined);
             if (serverExpiresAt) {
               if (Date.now() >= serverExpiresAt) {
                 logout();
@@ -236,7 +244,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (user) {
       const updatedUser = { ...user, ...updates };
       setUser(updatedUser);
-      authStorage.setSession(updatedUser, expiresAt ?? undefined);
+      authStorage.setSession(updatedUser, expiresAt ?? undefined, authStorage.getToken() || undefined);
     }
   };
 

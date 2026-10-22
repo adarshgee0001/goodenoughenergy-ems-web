@@ -1,4 +1,4 @@
-import { API_BASE } from '../../../utils/apiClient';
+import { API_BASE, authenticatedFetch } from '../../../utils/apiClient';
 import React, { useState, useEffect } from 'react';
 import { dashboardService } from '../../../features/dashboard/dashboard.service';
 import type { VoltageTrendPoint } from '../../../features/dashboard/dashboard.types';
@@ -250,9 +250,7 @@ export function VoltageTrendSection({
     url.searchParams.set('from', start.toISOString());
     url.searchParams.set('to', end.toISOString());
     
-    fetch(url.toString(), {
-      credentials: 'include'
-    }).then(response => {
+    authenticatedFetch(url.toString()).then(response => {
        if (response.ok) {
            response.blob().then(blob => {
              const a = document.createElement('a');

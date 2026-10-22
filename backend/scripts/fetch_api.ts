@@ -3,7 +3,7 @@ import path from 'path';
 const ExcelJS = require('exceljs');
 
 async function main() {
-  const loginRes = await fetch('http://localhost:5000/api/auth/login', {
+  const loginRes = await fetch('http://10.10.10.245:5000/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email: 'admin@gee.local', password: 'admin@321' })

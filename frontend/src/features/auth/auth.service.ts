@@ -1,10 +1,12 @@
 import type { User, LoginCredentials } from './auth.types';
+import { authStorage } from './auth.storage';
 
 // Backend API base URL — falls back to localhost:5000 for development
 import { API_BASE } from '../../utils/apiClient';
 
 export interface LoginResponse {
   user: User;
+  token?: string;
   expiresAt?: number;
 }
 
@@ -50,20 +52,33 @@ export const authService = {
       forcePasswordChange: data.user.forcePasswordChange,
     };
 
+    if (data.token) {
+      authStorage.setToken(data.token);
+    }
+
     return {
       user,
+      token: data.token,
       expiresAt: typeof data.expiresAt === 'number' ? data.expiresAt : undefined,
     };
   },
 
   logout: async (): Promise<void> => {
     try {
+      const token = authStorage.getToken();
+      const headers: Record<string, string> = {};
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
       await fetch(`${API_BASE}/api/auth/logout`, {
         method: 'POST',
+        headers,
         credentials: 'include',
       });
     } catch {
       // Ignore network errors on logout, local state will clear anyway
+    } finally {
+      authStorage.clearSession();
     }
   },
 };
