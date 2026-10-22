@@ -1,4 +1,8 @@
+// Production: http://storedge.goodenough.energy
+// Staging:    http://10.10.10.245:5000
+// Local:      http://localhost:5000
 export const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+
 
 export async function authenticatedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const response = await fetch(input, {
