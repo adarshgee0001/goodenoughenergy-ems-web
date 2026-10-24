@@ -45,11 +45,13 @@ export const login = async (req: Request, res: Response): Promise<void> => {
     const expiresAt = decoded.exp ? decoded.exp * 1000 : Date.now() + 24 * 60 * 60 * 1000;
 
     // Set HttpOnly cookie
-    const isProduction = process.env.NODE_ENV === 'production';
+    // secure:false and sameSite:'lax' work for both HTTP and HTTPS.
+    // If the site is deployed behind HTTPS with a valid certificate, set COOKIE_SECURE=true via environment variable.
+    const cookieSecure = process.env.COOKIE_SECURE === 'true';
     res.cookie('auth_token', token, {
       httpOnly: true,
-      secure: isProduction,
-      sameSite: isProduction ? 'none' : 'lax',
+      secure: cookieSecure,
+      sameSite: cookieSecure ? 'none' : 'lax',
       path: '/',
       maxAge: 24 * 60 * 60 * 1000 // 1 day
     });
@@ -178,11 +180,11 @@ export const changePassword = async (req: Request, res: Response): Promise<void>
 
 export const logout = async (req: Request, res: Response): Promise<void> => {
   try {
-    const isProduction = process.env.NODE_ENV === 'production';
+    const cookieSecure = process.env.COOKIE_SECURE === 'true';
     res.clearCookie('auth_token', {
       httpOnly: true,
-      secure: isProduction,
-      sameSite: isProduction ? 'none' : 'lax',
+      secure: cookieSecure,
+      sameSite: cookieSecure ? 'none' : 'lax',
       path: '/'
     });
     res.status(200).json({ success: true, message: 'Logged out successfully' });

@@ -157,9 +157,8 @@ export const WebSocketProvider: React.FC<{ children: ReactNode }> = ({ children 
 
     newSocket.on('connect_error', (err) => {
       console.error('[WebSocket] Connect Error:', err.message);
-      if (err.message === 'AUTH_REQUIRED') {
-        window.dispatchEvent(new Event('auth:expired'));
-      }
+      // WebSocket connection errors should not force-logout the user.
+      // HTTP 401 on /api/auth/me is the authoritative auth signal.
     });
 
     setSocket(newSocket);
